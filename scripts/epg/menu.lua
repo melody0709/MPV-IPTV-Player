@@ -43,13 +43,18 @@ function find_menu_group_item(menu_data, group_name)
     return nil
 end
 
-function update_cached_menu_channel_item(channel_url, bucket_key, reference_utc)
+function update_cached_menu_channel_item(channel_url, bucket_key, reference_utc, channel_key)
     local menu_data = state.last_iptv_menu_data
     if not menu_data then
         return nil, nil, nil
     end
 
-    local group_name, channel_index = find_channel_position_by_url(channel_url)
+    local group_name, channel_index
+    if channel_key and channel_key ~= "" then
+        group_name, channel_index = find_channel_position_by_key(channel_key)
+    else
+        group_name, channel_index = find_channel_position_by_url(channel_url)
+    end
     if not group_name or not channel_index then
         return nil, nil, nil
     end
@@ -68,7 +73,7 @@ function update_cached_menu_channel_item(channel_url, bucket_key, reference_utc)
         channel_index,
         ch,
         effective_reference_utc,
-        menu_active_channel and menu_active_channel.url == ch.url,
+        menu_active_channel and (menu_active_channel.key or menu_active_channel.url) == (ch.key or ch.url),
         bucket_key
     )
     apply_channel_item_menu_layout(
@@ -129,7 +134,7 @@ build_channel_epg_items = function(ch, programs)
                     title = prog.title,
                     subtitle = epg_subtitle,
                     value = {"script-message-to", "epg", "play-catchup",
-                        "", ch.catchup, prog.start_utc, prog.end_utc, ch.url}
+                        "", ch.catchup, prog.start_utc, prog.end_utc, ch.url, ch.key or ""}
                 })
             else
                 table.insert(epg_items, {
@@ -197,7 +202,8 @@ build_channel_date_bucket_items = function(ch, reference_utc, preload_bucket_key
                     "script-message-to", "epg", "open-channel-date-bucket",
                     ch.url,
                     bucket_key,
-                    reference_utc or ""
+                    reference_utc or "",
+                    ch.key or ""
                 }
                 bucket_item.keep_open = true
             end
@@ -374,7 +380,8 @@ build_main_menu = function(preload_target)
 
         for channel_idx, ch in ipairs(channels) do
             -- 判断是否为当前播放频道
-            local is_current = menu_active_channel and menu_active_channel.url == ch.url
+            local is_current = menu_active_channel
+                and (menu_active_channel.key or menu_active_channel.url) == (ch.key or ch.url)
             local reference_utc = get_menu_reference_utc_for_channel(ch, menu_active_channel, now_utc)
             if is_current then
                 current_group_idx = group_idx
@@ -382,7 +389,7 @@ build_main_menu = function(preload_target)
             end
 
             local forced_preload_bucket_key = nil
-            if preload_target and preload_target.channel_url == ch.url then
+            if preload_target and (preload_target.channel_key or preload_target.channel_url) == (ch.key or ch.url) then
                 forced_preload_bucket_key = preload_target.bucket_key
             end
 
@@ -518,8 +525,13 @@ function show_iptv_menu()
     end
 end
 
-function show_channel_date_bucket_menu(channel_url, bucket_key, reference_utc)
-    local ch = find_channel_by_url(channel_url)
+function show_channel_date_bucket_menu(channel_url, bucket_key, reference_utc, channel_key)
+    local ch
+    if channel_key and channel_key ~= "" then
+        ch = find_channel_by_key(channel_key)
+    else
+        ch = find_channel_by_url(channel_url)
+    end
     if not ch then
         return
     end
@@ -530,10 +542,11 @@ function show_channel_date_bucket_menu(channel_url, bucket_key, reference_utc)
         return
     end
 
-    local refreshed_menu_data, refreshed_channel = update_cached_menu_channel_item(channel_url, bucket_key, reference_utc)
+    local refreshed_menu_data, refreshed_channel = update_cached_menu_channel_item(channel_url, bucket_key, reference_utc, ch.key)
     if not refreshed_menu_data then
         refreshed_menu_data = build_main_menu({
             channel_url = channel_url,
+            channel_key = ch.key,
             bucket_key = bucket_key
         })
         if not refreshed_menu_data then
@@ -599,7 +612,7 @@ function build_catchup_epg_menu()
                                     title = display_text,
                                     search_key = prog.title,  -- 只用于搜索的EPG标题
                                     value = {"script-message-to", "epg", "play-catchup",
-                                        "", ch.catchup, prog.start_utc, prog.end_utc, ch.url},
+                                        "", ch.catchup, prog.start_utc, prog.end_utc, ch.url, ch.key or ""},
                                     hint = "回看",
                                     icon = "history"
                                 }

@@ -15,6 +15,12 @@ options = {
     epg_cache_refresh_start = "00:04",
     epg_cache_refresh_interval_hours = 7,
     catchup_preload_seconds = 15,
+    iptv_default_user_agent = "SYTV/1.6",
+    iptv_network_timeout = 8,
+    iptv_retry_count = 2,
+    iptv_retry_delay = 1.0,
+    iptv_format_fallback = true,
+    iptv_source_fallback = true,
     menu_subtitle_font_size = 0,
     menu_level1_min_width = 0,
     menu_level2_min_width = 0,
@@ -100,10 +106,20 @@ state = {
     group_names = {},
     epg_data = {},
     channel_bucket_cache = {},
-    url_to_channel_map = {},  -- ★ 新增：防止直接播放URL时报 nil 错误
-    known_hls_urls = {},      -- ★ 新增：初始化 HLS 缓存字典
-    error_retry_count = 0,    -- ★ 新增：记录当前报错重试了多少次
-    last_played_url = nil,    -- ★ 新增：记录最后一次尝试播放的URL
+    url_to_channel_map = {},
+    url_prefix_channel_map = {},
+    url_prefix_ambiguous = {},
+    channel_key_map = {},
+    format_cache = {},
+    format_cache_dirty = false,
+    last_played_url = nil,
+    last_played_source = nil,
+    current_source_index = nil,
+    playback_generation = 0,
+    active_playback_session = nil,
+    active_attempt = nil,
+    queued_playback_sessions = {},
+    playback_retry_timer = nil,
     is_loaded = false,
     current_channel = nil,
     history_file = "epg_history.json",
@@ -120,8 +136,6 @@ state = {
     queued_catchup_path = nil,
     next_catchup_queued = false,
     current_time_pos = 0,
-    pending_hls_retry = nil,
-    pending_hls_retry_timer = nil,
     last_iptv_menu_data = nil,
     is_subscription_mode = false,
     subscription_url = "",
@@ -151,7 +165,6 @@ MENU_RENDER_DELAY = 0.005
 MENU_EXPAND_DELAY = 0.005
 MENU_SELECT_DELAY = 0.005
 HISTORY_SAVE_DELAY = 2.0
-HLS_RETRY_DELAY = 0.35
 TIMEPOS_CHECK_INTERVAL = 1.0
 
 -- ==================== 日期桶常量 ====================
@@ -183,11 +196,29 @@ function sync_iptv_button_state()
     end
 
     local current_channel_url = state.current_channel and state.current_channel.url or nil
-    local is_live_channel = current_path and current_channel_url
-        and (current_path == current_channel_url or url_matches(current_path, current_channel_url))
+    local is_live_channel = false
+    if current_path and state.current_channel then
+        for _, source in ipairs(state.current_channel.sources or {}) do
+            if current_path == source.url or (url_matches and url_matches(current_path, source.url)) then
+                is_live_channel = true
+                break
+            end
+        end
+        if not is_live_channel and current_channel_url then
+            is_live_channel = current_path == current_channel_url
+                or (url_matches and url_matches(current_path, current_channel_url))
+        end
+    end
+    local active_attempt = state.active_attempt
+    if active_attempt and active_attempt.started and active_attempt.role == "live" then
+        is_live_channel = true
+    end
     local current_catchup_path = state.current_catchup_path
     local is_catchup_channel = current_path and current_catchup_path
-        and (current_path == current_catchup_path or url_matches(current_path, current_catchup_path))
+        and (current_path == current_catchup_path or (url_matches and url_matches(current_path, current_catchup_path)))
+    if active_attempt and active_attempt.started and active_attempt.role == "catchup" then
+        is_catchup_channel = true
+    end
     local is_local_m3u = normalized_path and state.m3u_path ~= "" and normalized_path == state.m3u_path
     local is_subscription_source = state.is_subscription_mode and state.is_loaded
     local is_iptv_active = is_live_channel or is_catchup_channel or is_local_m3u or is_subscription_source or false
@@ -206,12 +237,8 @@ function clear_queued_catchup_state()
     state.queued_catchup = nil
     state.queued_catchup_path = nil
     state.next_catchup_queued = false
-end
-
-function cancel_pending_hls_retry_timer()
-    if state.pending_hls_retry_timer then
-        state.pending_hls_retry_timer:kill()
-        state.pending_hls_retry_timer = nil
+    if clear_queued_iptv_playback_sessions then
+        clear_queued_iptv_playback_sessions()
     end
 end
 
@@ -276,14 +303,34 @@ local function perform_catchup_preload_check()
         catchup_template = cc.catchup_template,
         start_utc = next_start_utc,
         last_end_utc = next_end_utc,
-        last_duration = nil
+        last_duration = nil,
+        channel = cc.channel,
+        source = cc.source,
+        source_index = cc.source_index,
     }
 
-    if not load_iptv_url(new_url, "catchup-preload", false, false, "insert-next") then
+    local catchup_channel = cc.channel or find_channel_by_url(cc.live_url)
+    local sources = build_catchup_playback_sources(
+        catchup_channel,
+        next_start_utc,
+        next_end_utc,
+        cc.catchup_template,
+        new_url
+    )
+    local loaded, queued_session = load_iptv_sources(sources, "catchup-preload", {
+        role = "catchup",
+        channel = catchup_channel,
+        preferred_source_index = cc.source_index or state.current_source_index or 1,
+        load_mode = "insert-next",
+        clear_catchup_queue = false,
+    })
+    if not loaded or not queued_session or not queued_session.current_attempt then
         return
     end
 
-    set_queued_catchup_state(queued_context, new_url)
+    queued_context.source = queued_session.current_attempt.source
+    queued_context.source_index = queued_session.current_attempt.source_index
+    set_queued_catchup_state(queued_context, queued_session.current_attempt.source.url)
     mp.msg.info(string.format("回看预加载: 已提前排队下一段 start=%s end=%s", next_start_utc, next_end_utc))
 end
 
@@ -335,7 +382,14 @@ mp.register_script_message("play-live-channel", function(channel_url, show_osd, 
 
     local channel = find_channel_by_url(channel_url)
     if channel then
-        play_live_channel(channel, show_osd == "yes", group_name, numeric_channel_index)
+        local preferred_source_index = find_channel_source_index_by_url(channel, channel_url) or 1
+        play_live_channel(
+            channel,
+            show_osd == "yes",
+            group_name,
+            numeric_channel_index,
+            preferred_source_index
+        )
         return
     end
 
@@ -344,13 +398,13 @@ mp.register_script_message("play-live-channel", function(channel_url, show_osd, 
     end
 end)
 
-mp.register_script_message("open-channel-date-bucket", function(channel_url, bucket_key, reference_utc)
-    show_channel_date_bucket_menu(channel_url, bucket_key, reference_utc)
+mp.register_script_message("open-channel-date-bucket", function(channel_url, bucket_key, reference_utc, channel_key)
+    show_channel_date_bucket_menu(channel_url, bucket_key, reference_utc, channel_key)
 end)
 
 -- 处理回看播放请求（由菜单项触发）
--- 参数: catchup_url, catchup_template, start_utc, end_utc, live_url
-mp.register_script_message("play-catchup", function(catchup_url, catchup_template, start_utc, end_utc, live_url)
+-- 参数: catchup_url, catchup_template, start_utc, end_utc, live_url, channel_key（可选）
+mp.register_script_message("play-catchup", function(catchup_url, catchup_template, start_utc, end_utc, live_url, channel_key)
     mp.msg.info(string.format("play-catchup: start=%s end=%s", start_utc, end_utc))
     if not catchup_template or not start_utc or not end_utc or not live_url then
         mp.msg.error("play-catchup: 参数不完整")
@@ -363,34 +417,131 @@ mp.register_script_message("play-catchup", function(catchup_url, catchup_templat
         catchup_url = replace_catchup_time_params(catchup_template, start_utc, end_utc)
     end
 
-    clear_queued_catchup_state()
+    local catchup_channel
+    if channel_key and channel_key ~= "" then
+        catchup_channel = find_channel_by_key(channel_key)
+        if not catchup_channel then return end
+    else
+        catchup_channel = find_channel_by_url(live_url)
+    end
+    local same_current_channel = catchup_channel and state.current_channel and (
+        (catchup_channel.key and state.current_channel.key and catchup_channel.key == state.current_channel.key)
+        or (not catchup_channel.key and catchup_channel.url == state.current_channel.url)
+    )
+    local preferred_source_index = same_current_channel and (state.current_source_index or 1) or 1
+    local catchup_sources = build_catchup_playback_sources(
+        catchup_channel,
+        start_utc,
+        end_utc,
+        catchup_template,
+        catchup_url
+    )
+
+    local loaded = load_iptv_sources(catchup_sources, "catchup", {
+        role = "catchup",
+        channel = catchup_channel,
+        preferred_source_index = preferred_source_index,
+    })
+    if not loaded then return end
+
     set_current_catchup_state({
         live_url         = live_url,
         catchup_template = catchup_template,
         start_utc        = start_utc,
         last_end_utc     = end_utc,
-        last_duration    = nil
+        last_duration    = nil,
+        channel          = catchup_channel,
+        source           = catchup_sources[preferred_source_index] or catchup_sources[1],
+        source_index     = preferred_source_index,
     }, catchup_url)
 
-    local catchup_channel = find_channel_by_url(live_url)
     if catchup_channel then
         set_current_channel_state(catchup_channel)
     end
-
-    load_iptv_url(catchup_url, "catchup", false)
 end)
+
+local function resolve_local_m3u_path(path)
+    if not path or path == "" then return nil end
+    local lower_path = path:lower()
+    local scheme = lower_path:match("^([%a][%w+.-]*)://")
+    if scheme and scheme ~= "file" then
+        return nil
+    end
+    if not lower_path:match("%.m3u$") and not lower_path:match("%.m3u8$") then
+        return nil
+    end
+
+    local clean_path = path:gsub("^[Ff][Ii][Ll][Ee]://", "")
+    local is_windows = package.config:sub(1, 1) == '\\'
+    if is_windows and clean_path:match("^/%a:[/\\]") then
+        clean_path = clean_path:sub(2)
+    end
+    local wd = mp.get_property("working-directory") or ""
+    if wd ~= "" and not clean_path:match("^/") and not clean_path:match("^%a+:") then
+        clean_path = utils.join_path(wd, clean_path)
+    end
+    return clean_path
+end
+
+local local_m3u_hook_enabled = type(mp.add_hook) == "function"
+local local_m3u_intercept_generation = 0
+
+if local_m3u_hook_enabled then
+    -- 必须在 mpv 原生 playlist demuxer 展开 URL 之前接管。path observer 已经太晚，
+    -- 异步产生的裸 HLS 分片可能在 playlist-clear 后重新进入播放列表。
+    mp.add_hook("on_load", 20, function(hook)
+        local path = mp.get_property("path")
+        local clean_path = resolve_local_m3u_path(path)
+        if not clean_path then
+            hook:cont()
+            return
+        end
+
+        local is_iptv_m3u, content, parsed = probe_iptv_m3u(clean_path)
+        if not is_iptv_m3u then
+            -- 本地 HLS 或普通相对路径播放列表仍由 mpv 原生处理。
+            hook:cont()
+            return
+        end
+
+        local_m3u_intercept_generation = local_m3u_intercept_generation + 1
+        local generation = local_m3u_intercept_generation
+        state.active_source_kind = "local"
+        state.m3u_path = clean_path
+        set_current_catchup_state(nil, nil)
+
+        -- 让当前顶层条目只打开无网络副作用的 null://，随后由 descriptor session
+        -- replace；这样原始 M3U 中的 pipe URL 永远不会交给 mpv 原生解析。
+        mp.set_property("stream-open-filename", "null://")
+        mp.add_timeout(0, function()
+            if generation ~= local_m3u_intercept_generation then return end
+            -- stop 会丢弃当前原生 playlist 及其仍在异步展开的子条目；仅
+            -- playlist-clear 会保留 current，无法阻止晚到的裸 HLS 分片。
+            mp.commandv("stop")
+            mp.commandv("playlist-clear")
+            mp.osd_message("解析 M3U...", 2)
+            if parse_m3u(clean_path, {content = content, parsed = parsed}) then
+                mp.osd_message("IPTV 已加载！鼠标右键:选台菜单", 4)
+            else
+                mp.osd_message("IPTV M3U 解析失败", 4)
+            end
+            sync_iptv_button_state()
+        end)
+        hook:cont()
+    end)
+end
 
 -- 跟踪当前播放路径（M3U加载 + 频道跟踪）
 mp.observe_property("path", "string", function(name, path)
     if not path then return end
 
-    -- 先处理本地 M3U 打开，避免与频道跟踪逻辑冲突
-    local lower_path = path:lower()
-    if (lower_path:match("%.m3u$") or lower_path:match("%.m3u8$")) and not path:match("^http") then
-        local clean_path = path:gsub("^file://", "")
-        local wd = mp.get_property("working-directory") or ""
-        if wd ~= "" and not clean_path:match("^/") and not clean_path:match("^%a+:") then
-            clean_path = utils.join_path(wd, clean_path)
+    -- 本地 M3U 由 on_load hook 在原生 playlist demuxer 前接管；旧 mpv 没有
+    -- add_hook 时才保留 observer 兼容回退。
+    local clean_path = resolve_local_m3u_path(path)
+    if clean_path then
+        if local_m3u_hook_enabled then
+            sync_iptv_button_state()
+            return
         end
         if clean_path == state.m3u_path and state.is_loaded then
             sync_iptv_button_state()
@@ -407,27 +558,49 @@ mp.observe_property("path", "string", function(name, path)
         return
     end
 
-    local path_base = path:match("^([^?]+)") or path
-    local map_entry = state.url_to_channel_map[path_base]
+    if path_matches_active_catchup(path) then
+        sync_iptv_button_state()
+        return
+    end
+
+    local live_attempt = state.active_attempt
+    -- 已知直播请求保留 descriptor 身份；共用 URL 无法区分频道和不同 Header 的线路。
+    if live_attempt and live_attempt.role == "live" and live_attempt.channel
+        and url_matches(path, live_attempt.source.url) then
+        sync_iptv_button_state()
+        return
+    end
+
+    local map_entry = find_channel_map_entry_by_url(path)
 
     if map_entry then
         local ch = map_entry.channel
         local matched_group_name = map_entry.group_name
         local matched_channel_index = map_entry.channel_index
         local selected_channel = get_channel_by_position(state.selected_group_name, state.selected_channel_index)
-        if selected_channel and selected_channel.url ~= ch.url then
+        local selected_matches = selected_channel and (
+            (selected_channel.key and ch.key and selected_channel.key == ch.key)
+            or (not selected_channel.key and selected_channel.url == ch.url)
+        )
+        if selected_channel and not selected_matches then
             sync_iptv_button_state()
             return
         end
 
         set_current_catchup_state(nil, nil)
-        if selected_channel and selected_channel.url == ch.url then
+        if selected_matches then
             matched_group_name = state.selected_group_name
             matched_channel_index = state.selected_channel_index
             ch = selected_channel
         end
+        state.current_source_index = find_channel_source_index_by_url(ch, path)
+            or state.current_source_index
         set_selected_channel_position(matched_group_name, matched_channel_index)
-        if not state.current_channel or state.current_channel.url ~= ch.url then
+        local current_matches = state.current_channel and (
+            (state.current_channel.key and ch.key and state.current_channel.key == ch.key)
+            or (not state.current_channel.key and state.current_channel.url == ch.url)
+        )
+        if not current_matches then
             set_current_channel_state(ch)
             mp.msg.info("当前频道: " .. ch.name)
             if not state.auto_playing then
@@ -436,35 +609,6 @@ mp.observe_property("path", "string", function(name, path)
         end
         sync_iptv_button_state()
         return
-    end
-
-    for group_name, channels in pairs(state.groups) do
-        for _, ch in ipairs(channels) do
-            if ch.url == path or (path and url_matches(path, ch.url)) then
-                local selected_channel = get_channel_by_position(state.selected_group_name, state.selected_channel_index)
-                if selected_channel and selected_channel.url ~= ch.url then
-                    return
-                end
-
-                set_current_catchup_state(nil, nil)
-                local matched_group_name, matched_channel_index = find_channel_position_by_url(ch.url)
-                if selected_channel and selected_channel.url == ch.url then
-                    matched_group_name = state.selected_group_name
-                    matched_channel_index = state.selected_channel_index
-                    ch = selected_channel
-                end
-                set_selected_channel_position(matched_group_name, matched_channel_index)
-                if not state.current_channel or state.current_channel.url ~= ch.url then
-                    set_current_channel_state(ch)
-                    mp.msg.info("当前频道: " .. ch.name)
-                    if not state.auto_playing then
-                        save_current_channel_to_history()
-                    end
-                end
-                sync_iptv_button_state()
-                return
-            end
-        end
     end
 
     sync_iptv_button_state()
@@ -513,70 +657,28 @@ local function try_activate_queued_catchup_state()
     return true
 end
 
-mp.register_event("file-loaded", function()
-    cancel_pending_hls_retry_timer()
-    state.pending_hls_retry = nil
-    try_activate_queued_catchup_state()
-
-    if state.last_played_url and state.last_played_url:match("^https?://") then
-        local stream_path = mp.get_property("stream-open-filename") or ""
-        mp.msg.info(string.format("[当前URL] %s", stream_path))
+mp.register_event("start-file", function()
+    local handled, _, was_queued = handle_iptv_start_file()
+    if handled and was_queued then
+        try_activate_queued_catchup_state()
     end
+end)
+
+mp.register_event("file-loaded", function()
+    handle_iptv_file_loaded()
+    sync_iptv_button_state()
 end)
 
 mp.register_event("shutdown", function()
     flush_channel_history()
-    if state.history_dirty then
-        save_hls_force_cache()
-    end
+    save_iptv_format_cache()
 end)
 
 -- end-file 事件驱动回看续播
 mp.register_event("end-file", function(event)
-    if event.reason == "error" and state.pending_hls_retry then
-        local retry = state.pending_hls_retry
-        state.pending_hls_retry = nil
-        cancel_pending_hls_retry_timer()
-
-        if not state.known_hls_urls[retry.url] then
-            state.known_hls_urls[retry.url] = true
-            save_hls_force_cache()
-            mp.msg.info("已将此 URL 加入 HLS 强制缓存字典")
-        end
-
-        state.pending_hls_retry_timer = mp.add_timeout(HLS_RETRY_DELAY, function()
-            state.pending_hls_retry_timer = nil
-
-            local current_path = mp.get_property("path")
-            if current_path and current_path ~= retry.url and not url_matches(current_path, retry.url) then
-                mp.msg.info("IPTV HLS兼容: 跳过过期重试，当前播放目标已变化")
-                return
-            end
-
-            load_iptv_url(retry.url, retry.context, false, true, retry.load_mode, retry.file_options)
-        end)
+    if event.reason == "error" and handle_iptv_end_file(event) then
+        sync_iptv_button_state()
         return
-    end
-
-    if event.reason == "error" then
-        if state.last_played_url and state.last_played_url ~= "" then
-            local max_retries = 3
-            if state.error_retry_count < max_retries then
-                state.error_retry_count = state.error_retry_count + 1
-                mp.msg.warn(string.format("播放失败，准备发起第 %d 次自动重试: %s", state.error_retry_count, state.last_played_url))
-                mp.osd_message(string.format("连接失败，正在自动重试 (%d/%d)...", state.error_retry_count, max_retries), 2)
-                mp.add_timeout(1.5, function()
-                    local current_path = mp.get_property("path")
-                    if current_path == nil or current_path == state.last_played_url then
-                        mp.commandv("loadfile", state.last_played_url, "replace")
-                    end
-                end)
-                return
-            else
-                mp.osd_message("播放失败：服务器无响应或链接已失效", 4)
-                state.error_retry_count = 0
-            end
-        end
     end
 
     if event.reason ~= "eof" then
@@ -618,14 +720,33 @@ mp.register_event("end-file", function(event)
 
     local new_url = replace_catchup_time_params(cc.catchup_template, next_start_utc, next_end_utc)
     mp.msg.info(string.format("回看续播: start_utc %s -> %s, end_utc -> %s", cc.start_utc, next_start_utc, next_end_utc))
-    mp.msg.info("回看续播调试: new_url=" .. tostring(new_url))
+    mp.msg.info("回看续播调试: new_url=" .. redact_iptv_url(new_url))
     mp.osd_message(string.format("回看续播中... 已延伸至 %s:%s",
         next_end_utc:sub(9,10), next_end_utc:sub(11,12)), 3)
 
     cc.start_utc = next_start_utc
     cc.last_end_utc = next_end_utc
-    set_current_catchup_state(cc, new_url)
-    load_iptv_url(new_url, "catchup-resume", false)
+    local catchup_channel = cc.channel or find_channel_by_url(cc.live_url)
+    local sources = build_catchup_playback_sources(
+        catchup_channel,
+        next_start_utc,
+        next_end_utc,
+        cc.catchup_template,
+        new_url
+    )
+    local loaded, session = load_iptv_sources(sources, "catchup-resume", {
+        role = "catchup",
+        channel = catchup_channel,
+        preferred_source_index = cc.source_index or state.current_source_index or 1,
+    })
+    if loaded and session and session.current_attempt then
+        cc.channel = catchup_channel
+        cc.source = session.current_attempt.source
+        cc.source_index = session.current_attempt.source_index
+        set_current_catchup_state(cc, session.current_attempt.source.url)
+    else
+        set_current_catchup_state(nil, nil)
+    end
 end)
 
 -- ==================== 初始化 ====================
@@ -643,7 +764,7 @@ mp.msg.info("配置目录: " .. tostring(expanded_home ~= "" and expanded_home o
 mp.msg.info("==========================")
 
 load_channel_history()
-load_hls_force_cache()
+load_iptv_format_cache()
 sync_iptv_button_state()
 
 mp.add_timeout(0.2, function()

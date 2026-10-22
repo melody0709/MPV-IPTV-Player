@@ -1,4 +1,20 @@
 # Changelog
+## V1.9.0 - 2026-07-12
+
+- 将频道播放模型从单一裸 URL 升级为完整 source descriptor：保留 URL、逐频道 Header、格式、DRM、回看模板与同频道多线路，同时保留 `channel.url` 兼容字段
+- 新增纯 M3U 状态机，支持 `#EXTVLCOPT:http-*`、`#EXTHTTP`、`#KODIPROP`、URL pipe Header、playlist/EXTINF 默认值及明确格式/MIME；同分组同 `tvg-id`（无 id 时同名）条目自动聚合为备用 source
+- 新增 Header 安全与 mpv 文件级映射：拒绝 Header CR/LF 注入，正确转义 `http-header-fields`，将 UA/Referer/Origin/Cookie/Authorization 传给 mpv，并强制 IPTV 网络链留在 lavf、使用 `demuxer-lavf-propagate-opts=yes` 传播到 HLS 子清单、密钥和分片
+- 用统一 playback session/attempt 状态机替换旧 HLS retry 与裸 URL 通用重试：按显式/缓存格式、自动探测、HLS、MPEG-TS、下一 source 有限推进，并以 playlist entry id 隔离切台时的旧 `end-file` 事件
+- 本地 IPTV M3U 在 `on_load` 阶段阻止 mpv 原生裸播放列表展开；直播点击、首频道启动、PgUp/PgDn、历史恢复、EPG 回看、`insert-next` 预加载、EOF 续播和错误恢复全部复用完整 descriptor，不再丢失 Header/格式 file options
+- 动态 `.php/.jsp/.asp` 地址不再被排除在格式候选外；DRM-only 频道会明确提示当前 mpv 层不支持，避免无意义重试
+- URL 索引改为精确 source URL；只有本身不带 query 的 source 才建立安全前缀索引，source 选择采用精确优先/最长前缀，回看 path 优先按活动 session 识别，修复不同 query 频道串台和回看状态被误清空
+- 历史记录新增 `channel_key/source_id/source_index`，订阅历史键从明文 URL 迁移为哈希；最终重定向短期 URL 不写入历史
+- 修复共用 URL 的频道在回看菜单、延迟展开、节目搜索及订阅移除后的身份混淆；DRM 拒绝后保留原频道、回看和历史状态
+- 订阅重排线路后按 source.id 重定位重连成功线路，避免旧序号覆盖新历史；已移除的线路不误记为其他 source
+- HLS 明文 URL 缓存替换为安全 source 哈希格式缓存；source 历史身份覆盖格式/回看/DRM，远程订阅先验证再事务替换 last-known-good；播放日志统一脱敏 query，只输出 Header 名和分类错误
+- IPTV UA 与网络超时从 `mpv.conf` 全局设置迁移为 `epg.conf` 文件级配置，默认超时从旧 3 秒调整为 8 秒；FFmpeg 默认保留 warn 日志
+- 新增 source、M3U、候选策略、重试计数、订阅缓存与实际 session 事件测试，以及本地 M3U 接管 → 302 → HLS → TS 全请求 Header 传播集成测试；不修改 uosc 源码
+
 ## V1.8.0 - 2026-04-02
 
 - 新增本地私有覆盖配置机制：脚本会先读取默认配置，再读取本地私有覆盖配置，后者优先级最高，适合存放个人 EPG / M3U 地址

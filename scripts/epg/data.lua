@@ -5,6 +5,8 @@
 
 local mp = require 'mp'
 local utils = require 'mp.utils'
+local source_model = require 'source'
+local m3u_parser = require 'm3u'
 
 -- ==================== EPG 缓存相关函数 ====================
 
@@ -54,6 +56,14 @@ function get_subscription_m3u_key(url)
     if normalized_url == "" then
         return ""
     end
+    return "sub:" .. simple_hash(normalized_url)
+end
+
+local function get_legacy_subscription_m3u_key(url)
+    local normalized_url = trim(url or "")
+    if normalized_url == "" then
+        return ""
+    end
     return "sub:" .. normalized_url
 end
 
@@ -68,14 +78,62 @@ end
 local function save_cache_file(cache_path, data, label)
     if not cache_path or not data then return false end
 
-    local file, err = io.open(cache_path, "wb")
+    local suffix = string.format(".tmp.%d.%d", os.time(), math.random(100000, 999999))
+    local temp_path = cache_path .. suffix
+    local backup_path = cache_path .. ".bak"
+    local file, err = io.open(temp_path, "wb")
     if not file then
         mp.msg.warn(string.format("无法保存%s: %s", label or "缓存文件", tostring(err)))
         return false
     end
 
-    file:write(data)
-    file:close()
+    local write_ok, write_err = file:write(data)
+    local flush_ok, flush_err = file:flush()
+    local close_ok, close_err = file:close()
+    if not write_ok or not flush_ok or not close_ok then
+        os.remove(temp_path)
+        mp.msg.warn(string.format(
+            "无法完整写入%s: %s",
+            label or "缓存文件",
+            tostring(write_err or flush_err or close_err)
+        ))
+        return false
+    end
+
+    local existing = io.open(cache_path, "rb")
+    local had_existing = existing ~= nil
+    if existing then existing:close() end
+
+    if had_existing then
+        os.remove(backup_path)
+        local backed_up, backup_err = os.rename(cache_path, backup_path)
+        if not backed_up then
+            os.remove(temp_path)
+            mp.msg.warn(string.format("无法备份旧%s: %s", label or "缓存文件", tostring(backup_err)))
+            return false
+        end
+    end
+
+    local installed, install_err = os.rename(temp_path, cache_path)
+    if not installed then
+        os.remove(temp_path)
+        if had_existing then
+            local restored, restore_err = os.rename(backup_path, cache_path)
+            if not restored then
+                mp.msg.error(string.format(
+                    "%s更新失败且旧缓存恢复失败: %s",
+                    label or "缓存文件",
+                    tostring(restore_err)
+                ))
+            end
+        end
+        mp.msg.warn(string.format("无法替换%s: %s", label or "缓存文件", tostring(install_err)))
+        return false
+    end
+
+    if had_existing then
+        os.remove(backup_path)
+    end
     mp.msg.info(string.format("%s已保存: %s (%d 字节)", label or "缓存文件", cache_path, #data))
     return true
 end
@@ -297,10 +355,31 @@ function load_channel_history()
         mp.msg.info("历史记录文件大小: " .. #content .. " 字节")
         local success, data = pcall(utils.parse_json, content)
         if success and type(data) == "table" then
+            local legacy_migrations = {}
+            for history_key, history_value in pairs(data) do
+                local subscription_url = tostring(history_key):match("^sub:(https?://.+)$")
+                if subscription_url then
+                    legacy_migrations[#legacy_migrations + 1] = {
+                        old_key = history_key,
+                        new_key = get_subscription_m3u_key(subscription_url),
+                        value = history_value,
+                    }
+                end
+            end
+            for _, migration in ipairs(legacy_migrations) do
+                if not data[migration.new_key] then
+                    data[migration.new_key] = migration.value
+                end
+                data[migration.old_key] = nil
+            end
             state.channel_history = data
             local count = 0
             for k, v in pairs(data) do count = count + 1 end
             mp.msg.info("频道历史记录已加载，共 " .. count .. " 个 m3u 文件的记录")
+            if #legacy_migrations > 0 then
+                state.history_dirty = true
+                mp.msg.info(string.format("已迁移 %d 个旧版明文订阅历史键为安全哈希键", #legacy_migrations))
+            end
         else
             mp.msg.warn("频道历史记录文件格式错误: " .. tostring(data))
             state.channel_history = {}
@@ -382,10 +461,15 @@ function save_current_channel_to_history()
     if not state.current_channel or not state.current_channel.url then return end
 
     local m3u_key = get_m3u_key(state.m3u_path)
+    local source_index = tonumber(state.current_source_index) or 1
+    local source = state.current_channel.sources and state.current_channel.sources[source_index] or nil
     state.channel_history[m3u_key] = {
         url = state.current_channel.url,
         name = state.current_channel.name,
         group = state.current_channel.group,
+        channel_key = state.current_channel.key,
+        source_index = source_index,
+        source_id = source and source.id or nil,
         timestamp = os.time()
     }
     schedule_channel_history_save(state.current_channel.name)
@@ -397,6 +481,17 @@ function load_last_channel_from_history()
 
     local m3u_key = get_m3u_key(state.m3u_path)
     local history = state.channel_history[m3u_key]
+
+    if not history and state.is_subscription_mode and state.subscription_url ~= "" then
+        local legacy_key = get_legacy_subscription_m3u_key(state.subscription_url)
+        history = state.channel_history[legacy_key]
+        if history then
+            state.channel_history[m3u_key] = history
+            state.channel_history[legacy_key] = nil
+            schedule_channel_history_save(history.name)
+            mp.msg.info("已将旧版明文订阅历史键迁移为安全哈希键")
+        end
+    end
 
     if history and history.url then
         mp.msg.info("从历史记录加载频道: " .. (history.name or "未知"))
@@ -677,7 +772,12 @@ local function apply_parsed_channel_selection(channel)
         return false
     end
 
-    local matched_group_name, matched_channel_index = find_channel_position_by_url(channel.url)
+    local matched_group_name, matched_channel_index
+    if channel.key and channel.key ~= "" then
+        matched_group_name, matched_channel_index = find_channel_position_by_key(channel.key)
+    else
+        matched_group_name, matched_channel_index = find_channel_position_by_url(channel.url)
+    end
     if matched_group_name and matched_channel_index then
         local resolved_channel = set_selected_channel_position(matched_group_name, matched_channel_index) or channel
         set_current_channel_state(resolved_channel)
@@ -775,6 +875,17 @@ function refresh_subscription_m3u_async(force_refresh, callback)
             return
         end
 
+        -- 必须在覆盖 last-known-good 缓存前验证下载内容。curl 对部分 HTTP
+        -- 错误页仍会返回成功状态，非空 HTML/登录页不能污染正式订阅缓存。
+        local downloaded_parsed, validation_err = validate_iptv_m3u_content(data)
+        if not downloaded_parsed then
+            mp.msg.error("M3U 订阅内容无效，保留旧缓存: " .. tostring(validation_err))
+            if callback then
+                callback(false, {reason = "parse-failed", detail = validation_err, cache_path = cache_path})
+            end
+            return
+        end
+
         local new_hash = simple_hash(data)
         local changed = new_hash ~= previous_hash
 
@@ -807,6 +918,8 @@ function refresh_subscription_m3u_async(force_refresh, callback)
             local was_loaded = state.is_loaded and state.m3u_source_key == source_key
             state.active_source_kind = "subscription"
             local parse_ok = parse_m3u(cache_path, {
+                content = data,
+                parsed = downloaded_parsed,
                 is_subscription = true,
                 source_key = source_key,
                 cache_path = cache_path,
@@ -915,13 +1028,69 @@ end
 
 -- ==================== M3U 解析 ====================
 
+local function parse_m3u_content_safe(content)
+    local input = tostring(content or "")
+    if input:find("#EXT%-X%-", 1) then
+        return nil, "hls-playlist"
+    end
+
+    local parse_ok, parsed = pcall(m3u_parser.parse, input, {
+        json_decode = utils.parse_json,
+    })
+    if not parse_ok or type(parsed) ~= "table" then
+        return nil, tostring(parsed)
+    end
+    if not parsed.channel_count or parsed.channel_count == 0 then
+        return nil, "no-playable-channels"
+    end
+    return parsed, nil
+end
+
+function validate_iptv_m3u_content(content)
+    return parse_m3u_content_safe(content)
+end
+
+-- on_load hook 在允许 mpv 原生打开播放列表前调用此函数。返回已解析结果，
+-- 让调用方只接管真正的 IPTV M3U；本地 HLS/普通相对路径播放列表继续交给 mpv。
+function probe_iptv_m3u(path)
+    local content = read_file_safe(path)
+    if not content then
+        return false, nil, nil, "read-failed"
+    end
+    local parsed, parse_err = parse_m3u_content_safe(content)
+    if not parsed then
+        return false, content, nil, parse_err
+    end
+    return true, content, parsed, nil
+end
+
 function parse_m3u(path, parse_options)
     parse_options = parse_options or {}
-    local content = read_file_safe(path)
+    local content = parse_options.content or read_file_safe(path)
     if not content then return false end
 
     local preserve_current_channel = parse_options.preserve_current_channel == true
     local previous_channel = preserve_current_channel and state.current_channel or nil
+    local previous_source_index = preserve_current_channel and state.current_source_index or nil
+    local previous_source = previous_channel and previous_channel.sources
+        and previous_channel.sources[tonumber(previous_source_index) or 1] or nil
+    local previous_source_id = previous_source and previous_source.id or nil
+
+    local parsed = parse_options.parsed
+    local parse_err
+    if type(parsed) ~= "table" then
+        parsed, parse_err = parse_m3u_content_safe(content)
+    end
+    if not parsed then
+        if parse_err == "no-playable-channels" then
+            mp.msg.error("M3U 中没有找到可播放频道")
+        elseif parse_err == "hls-playlist" then
+            mp.msg.error("检测到 HLS 媒体清单，不作为 IPTV 频道列表解析")
+        else
+            mp.msg.error("M3U 解析失败: " .. tostring(parse_err))
+        end
+        return false
+    end
 
     state.m3u_path = path
     state.m3u_source_key = parse_options.source_key or normalize_m3u_key(path)
@@ -931,82 +1100,144 @@ function parse_m3u(path, parse_options)
     state.subscription_last_hash = parse_options.content_hash or (state.is_subscription_mode and simple_hash(content) or nil)
     state.active_source_kind = state.is_subscription_mode and "subscription" or "local"
 
-    state.groups = {}
-    state.group_names = {}
+    state.groups = parsed.groups
+    state.group_names = parsed.group_names
     state.channel_bucket_cache = {}
     state.url_to_channel_map = {}
+    state.url_prefix_channel_map = {}
+    state.url_prefix_ambiguous = {}
+    state.channel_key_map = {}
     state.epg_buckets = {}
     channel_search_cache = {}
     state.selected_group_name = nil
     state.selected_channel_index = nil
+    state.current_source_index = nil
     if not preserve_current_channel then
         set_current_channel_state(nil)
         set_current_catchup_state(nil, nil)
     end
     state.epg_url = trim(options.epg_download_url)
     if state.epg_url ~= "" then
-        mp.msg.info("使用配置的 EPG 下载连接: " .. state.epg_url)
+        mp.msg.info("使用配置的 EPG 下载连接: " .. source_model.redact_url(state.epg_url))
+    elseif parsed.epg_url and parsed.epg_url ~= "" then
+        state.epg_url = trim(parsed.epg_url)
     end
-    local current_info = {}
-    for line in content:gmatch("([^\r\n]+)") do
-        if line:match("^#EXTM3U") then
-            local epg = line:match('x%-tvg%-url="([^"]+)"')
-            if epg and state.epg_url == "" then state.epg_url = trim(epg) end
-        elseif line:match("^#EXTINF") then
-            local comma_name = line:match(",(.*)$")
-            current_info = {
-                tvg_id = line:match('tvg%-id="([^"]+)"') or "",
-                name = comma_name or line:match('tvg%-name="([^"]+)"') or "未知频道",
-                catchup = line:match('catchup%-source="([^"]+)"') or "",
-                group = line:match('group%-title="([^"]+)"') or "其他频道",
-                logo = line:match('tvg%-logo="([^"]+)"') or ""
-            }
-        elseif line:match("^http") or line:match("^rtsp") or line:match("^rtmp") or line:match("^udp") then
-            current_info.url = line
-            if not state.groups[current_info.group] then
-                state.groups[current_info.group] = {}
-                table.insert(state.group_names, current_info.group)
-            end
-            local channel_index = #state.groups[current_info.group] + 1
-            local ch_entry = {
-                name = current_info.name,
-                url = line,
-                tvg_id = current_info.tvg_id,
-                catchup = current_info.catchup,
-                logo = current_info.logo,
-                group = current_info.group
-            }
-            table.insert(state.groups[current_info.group], ch_entry)
-            local base_url = line:match("^([^?]+)") or line
-            state.url_to_channel_map[base_url] = {
-                group_name = current_info.group,
+
+    for _, group_name in ipairs(state.group_names) do
+        local channels = state.groups[group_name] or {}
+        for channel_index, channel in ipairs(channels) do
+            local map_entry = {
+                group_name = group_name,
                 channel_index = channel_index,
-                channel = ch_entry
+                channel = channel,
             }
-            current_info = {}
+            if channel.key then
+                state.channel_key_map[channel.key] = map_entry
+            end
+            for _, source in ipairs(channel.sources or {}) do
+                if not state.url_to_channel_map[source.url] then
+                    state.url_to_channel_map[source.url] = map_entry
+                end
+                local source_base = source.url:match("^([^?#]+)") or source.url
+                local has_query_or_fragment = source_base ~= source.url
+                if has_query_or_fragment then
+                    state.url_prefix_ambiguous[source_base] = true
+                    state.url_prefix_channel_map[source_base] = nil
+                elseif not state.url_prefix_ambiguous[source_base]
+                    and not state.url_prefix_channel_map[source_base] then
+                    state.url_prefix_channel_map[source_base] = map_entry
+                end
+            end
         end
     end
     state.is_loaded = true
 
+    mp.msg.info(string.format(
+        "M3U 解析完成: %d 个频道 / %d 条线路 / %d 条重复线路已合并 / %d 条 DRM 线路",
+        parsed.channel_count,
+        parsed.source_count or 0,
+        parsed.duplicate_source_count or 0,
+        parsed.drm_source_count or 0
+    ))
+    if (parsed.rejected_header_count or 0) > 0 then
+        mp.msg.warn(string.format("M3U 中有 %d 个不安全或无效 Header 已被忽略", parsed.rejected_header_count))
+    end
+
     if preserve_current_channel and previous_channel and apply_parsed_channel_selection(previous_channel) then
+        local resolved_source_index = tonumber(previous_source_index) or 1
+        if previous_source_id and state.current_channel and state.current_channel.sources then
+            for source_index, source in ipairs(state.current_channel.sources) do
+                if source.id == previous_source_id then
+                    resolved_source_index = source_index
+                    break
+                end
+            end
+        end
+        if not state.current_channel.sources or not state.current_channel.sources[resolved_source_index] then
+            resolved_source_index = 1
+        end
+        state.current_source_index = resolved_source_index
         mp.msg.info("订阅刷新后已保持当前频道状态")
     else
         local should_restore_history = parse_options.history_autoplay ~= false
+        local did_autoplay = false
+        local function schedule_auto_playing_reset()
+            mp.add_timeout(1.5, function()
+                state.auto_playing = false
+                mp.msg.info("自动播放标记已清除")
+            end)
+        end
         if should_restore_history then
             local last_channel = load_last_channel_from_history()
             if last_channel and last_channel.url then
-                mp.msg.info("自动播放上次频道: " .. (last_channel.name or "未知"))
-                state.auto_playing = true  -- 标记正在自动播放
-                local last_group_name, last_channel_index = find_channel_position_by_url(last_channel.url)
-                local resolved_channel = set_selected_channel_position(last_group_name, last_channel_index) or last_channel
-                -- 先设置 current_channel，这样菜单能正确识别当前频道
-                set_current_channel_state(resolved_channel)
-                load_iptv_url(last_channel.url, "history-resume")
-                -- 播放命令发送后，延迟清除标记（给路径变化监听器足够时间）
-                mp.add_timeout(1.5, function()
-                    state.auto_playing = false
-                    mp.msg.info("自动播放标记已清除")
-                end)
+                local last_group_name, last_channel_index
+                if last_channel.channel_key then
+                    last_group_name, last_channel_index = find_channel_position_by_key(last_channel.channel_key)
+                end
+                if not last_group_name then
+                    last_group_name, last_channel_index = find_channel_position_by_url(last_channel.url)
+                end
+                local resolved_channel = get_channel_by_position(last_group_name, last_channel_index)
+                if resolved_channel then
+                    local preferred_source_index = tonumber(last_channel.source_index) or 1
+                    if last_channel.source_id and resolved_channel.sources then
+                        for source_index, source in ipairs(resolved_channel.sources) do
+                            if source.id == last_channel.source_id then
+                                preferred_source_index = source_index
+                                break
+                            end
+                        end
+                    end
+                    mp.msg.info("自动播放上次频道: " .. (resolved_channel.name or last_channel.name or "未知"))
+                    state.auto_playing = true
+                    play_live_channel(
+                        resolved_channel,
+                        false,
+                        last_group_name,
+                        last_channel_index,
+                        preferred_source_index,
+                        "history-resume"
+                    )
+                    did_autoplay = true
+                    schedule_auto_playing_reset()
+                else
+                    mp.msg.warn("历史频道已不在当前 M3U 中，跳过自动播放")
+                end
+            end
+
+            -- mpv 原生打开本地 M3U 时本来就会播放第一项；显式走 descriptor
+            -- 可确保第一项的 pipe/Header/格式选项不会在首次启动时丢失。
+            if not did_autoplay then
+                local first_group_name = state.group_names[1]
+                local first_channel = first_group_name and state.groups[first_group_name]
+                    and state.groups[first_group_name][1] or nil
+                if first_channel then
+                    mp.msg.info("未找到可恢复历史，使用完整 source descriptor 播放首个频道: " .. first_channel.name)
+                    state.auto_playing = true
+                    play_live_channel(first_channel, false, first_group_name, 1, 1, "playlist-first")
+                    did_autoplay = true
+                    schedule_auto_playing_reset()
+                end
             end
         end
     end
@@ -1023,11 +1254,47 @@ end
 -- ==================== URL 匹配 ====================
 
 function url_matches(path, target_url)
+    if not path or not target_url or target_url == "" then return false end
     if path == target_url then return true end
     local target_len = #target_url
     if path:sub(1, target_len) == target_url then
         local next_char = path:sub(target_len + 1, target_len + 1)
-        if next_char:match("[?#/]") then
+        local target_has_query = target_url:find("?", 1, true) ~= nil
+        if (target_has_query and next_char:match("[&#]"))
+            or (not target_has_query and next_char:match("[?#]")) then
+            return true
+        end
+    end
+    return false
+end
+
+local function path_matches_target(path, target_url)
+    return path and target_url
+        and (path == target_url or url_matches(path, target_url))
+end
+
+-- path observer 必须先保护当前/排队中的回看 attempt。回看 URL 经常只是在
+-- 直播 URL 后追加 query；若先查直播索引，会误清空 current_catchup。
+function path_matches_active_catchup(path)
+    if not path then return false end
+
+    if state.current_catchup and path_matches_target(path, state.current_catchup_path) then
+        return true
+    end
+    if state.queued_catchup and path_matches_target(path, state.queued_catchup_path) then
+        return true
+    end
+
+    local active_attempt = state.active_attempt
+    if active_attempt and active_attempt.role == "catchup"
+        and active_attempt.source and path_matches_target(path, active_attempt.source.url) then
+        return true
+    end
+
+    for _, queued_session in ipairs(state.queued_playback_sessions or {}) do
+        local queued_attempt = queued_session.current_attempt
+        if queued_attempt and queued_attempt.role == "catchup"
+            and queued_attempt.source and path_matches_target(path, queued_attempt.source.url) then
             return true
         end
     end
@@ -1124,54 +1391,77 @@ function get_channel_bucket_data(ch)
     return buckets
 end
 
-function find_channel_by_url(url)
+function find_channel_map_entry_by_url(url)
     if not url or url == "" then
         return nil
     end
 
-    local base_url = url:match("^([^?]+)") or url
-    local map_entry = state.url_to_channel_map and state.url_to_channel_map[base_url]
+    local clean_url = source_model.split_url_headers(url)
+    local map_entry = state.url_to_channel_map and state.url_to_channel_map[clean_url]
     if map_entry then
-        return map_entry.channel
+        return map_entry
     end
 
-    for _, group_name in ipairs(state.group_names) do
-        local channels = state.groups[group_name]
-        if channels then
-            for _, ch in ipairs(channels) do
-                if ch.url == url then
-                    return ch
-                end
-            end
-        end
+    local without_query = clean_url:match("^([^?#]+)") or clean_url
+    map_entry = state.url_prefix_channel_map and state.url_prefix_channel_map[without_query]
+    if map_entry and url_matches(clean_url, without_query) then
+        return map_entry
     end
 
-    return nil
-end
-
-function find_channel_position_by_url(channel_url)
-    if not channel_url or channel_url == "" then
-        return nil, nil
-    end
-
-    local base_url = channel_url:match("^([^?]+)") or channel_url
-    local map_entry = state.url_to_channel_map and state.url_to_channel_map[base_url]
-    if map_entry then
-        return map_entry.group_name, map_entry.channel_index
-    end
-
+    local best_entry = nil
+    local best_match_length = -1
     for _, group_name in ipairs(state.group_names) do
         local channels = state.groups[group_name]
         if channels then
             for channel_index, ch in ipairs(channels) do
-                if ch.url == channel_url then
-                    return group_name, channel_index
+                for _, source in ipairs(ch.sources or {}) do
+                    if source.url == clean_url or url_matches(clean_url, source.url) then
+                        local match_length = #source.url
+                        if match_length > best_match_length then
+                            best_match_length = match_length
+                            best_entry = {
+                                group_name = group_name,
+                                channel_index = channel_index,
+                                channel = ch,
+                            }
+                        end
+                    end
                 end
             end
         end
     end
 
+    return best_entry
+end
+
+function find_channel_by_url(url)
+    local map_entry = find_channel_map_entry_by_url(url)
+    return map_entry and map_entry.channel or nil
+end
+
+function find_channel_position_by_url(channel_url)
+    local map_entry = find_channel_map_entry_by_url(channel_url)
+    if map_entry then
+        return map_entry.group_name, map_entry.channel_index
+    end
+
     return nil, nil
+end
+
+function find_channel_position_by_key(channel_key)
+    if not channel_key or channel_key == "" then
+        return nil, nil
+    end
+    local map_entry = state.channel_key_map and state.channel_key_map[channel_key]
+    if map_entry then
+        return map_entry.group_name, map_entry.channel_index
+    end
+    return nil, nil
+end
+
+function find_channel_by_key(channel_key)
+    local group_name, channel_index = find_channel_position_by_key(channel_key)
+    return get_channel_by_position(group_name, channel_index)
 end
 
 get_channel_by_position = function(group_name, channel_index)
@@ -1200,7 +1490,7 @@ end
 
 function get_menu_active_channel()
     if state.current_catchup and state.current_catchup.live_url then
-        local catchup_channel = find_channel_by_url(state.current_catchup.live_url)
+        local catchup_channel = state.current_catchup.channel or find_channel_by_url(state.current_catchup.live_url)
         if catchup_channel then
             return catchup_channel
         end
@@ -1214,36 +1504,121 @@ function get_menu_active_channel()
     return state.current_channel
 end
 
--- ==================== HLS 强制缓存 ====================
+-- ==================== IPTV 格式缓存（仅保存 source 哈希） ====================
 
-function get_hls_cache_file_path()
+function get_iptv_format_cache_file_path()
     local history_path = get_history_file_path()
     if history_path then
-        return history_path:gsub("epg_history%.json", "hls_force_cache.json")
+        local replaced, count = history_path:gsub("epg_history%.json$", "iptv_format_cache.json")
+        if count > 0 then
+            return replaced
+        end
+        local directory = history_path:match("^(.*)[\\/]")
+        if directory then
+            return utils.join_path(directory, "iptv_format_cache.json")
+        end
+    end
+    return "iptv_format_cache.json"
+end
+
+local function get_legacy_hls_cache_file_path()
+    local history_path = get_history_file_path()
+    if history_path then
+        local replaced, count = history_path:gsub("epg_history%.json$", "hls_force_cache.json")
+        if count > 0 then
+            return replaced
+        end
+        local directory = history_path:match("^(.*)[\\/]")
+        if directory then
+            return utils.join_path(directory, "hls_force_cache.json")
+        end
     end
     return "hls_force_cache.json"
 end
 
-function load_hls_force_cache()
-    state.known_hls_urls = {}
-    local path = get_hls_cache_file_path()
+function load_iptv_format_cache()
+    state.format_cache = {}
+    state.format_cache_dirty = false
+    local path = get_iptv_format_cache_file_path()
     local file = io.open(path, "r")
     if file then
         local content = file:read("*a")
         file:close()
         local success, data = pcall(utils.parse_json, content)
-        if success and type(data) == "table" then
-            state.known_hls_urls = data
-            mp.msg.info("HLS 强制缓存已加载，共 " .. #data .. " 条记录")
+        if success and type(data) == "table" and type(data.formats) == "table" then
+            local count = 0
+            for cache_key, format in pairs(data.formats) do
+                local normalized = source_model.normalize_format(format)
+                if tostring(cache_key):match("^src:%x+$") and normalized then
+                    state.format_cache[cache_key] = normalized
+                    count = count + 1
+                end
+            end
+            mp.msg.info("IPTV 安全格式缓存已加载，共 " .. count .. " 条记录")
+        end
+    end
+
+    local legacy_path = get_legacy_hls_cache_file_path()
+    local legacy_file = io.open(legacy_path, "r")
+    if legacy_file then
+        local legacy_content = legacy_file:read("*a")
+        legacy_file:close()
+        local legacy_ok, legacy_data = pcall(utils.parse_json, legacy_content)
+        local migrated_count = 0
+        if legacy_ok and type(legacy_data) == "table" then
+            for legacy_url, forced_hls in pairs(legacy_data) do
+                if forced_hls == true and source_model.is_media_url(legacy_url) then
+                    local legacy_source = source_model.make_source(legacy_url, {headers = {}})
+                    state.format_cache[legacy_source.format_cache_key] = "hls"
+                    migrated_count = migrated_count + 1
+                end
+            end
+        end
+        if migrated_count > 0 then
+            state.format_cache_dirty = true
+            if save_iptv_format_cache() then
+                local removed, remove_err = os.remove(legacy_path)
+                if removed then
+                    mp.msg.info(string.format("已迁移并移除旧版明文 HLS URL 缓存，共 %d 条", migrated_count))
+                else
+                    mp.msg.warn("旧版明文 HLS URL 缓存已迁移，但删除失败: " .. tostring(remove_err))
+                end
+            end
         end
     end
 end
 
-function save_hls_force_cache()
-    local path = get_hls_cache_file_path()
-    local file = io.open(path, "w")
-    if file then
-        file:write(utils.format_json(state.known_hls_urls))
-        file:close()
+function remember_iptv_source_format(source, format)
+    local normalized = source_model.normalize_format(format)
+    if type(source) ~= "table" or not normalized then
+        return false
     end
+    local cache_key = type(source.format_cache_key) == "string"
+        and source.format_cache_key:match("^src:%x+$") and source.format_cache_key
+        or source_model.source_cache_key(source)
+    if state.format_cache[cache_key] == normalized then
+        return false
+    end
+    state.format_cache[cache_key] = normalized
+    state.format_cache_dirty = true
+    return true
+end
+
+function save_iptv_format_cache()
+    if not state.format_cache_dirty then
+        return false
+    end
+    local path = get_iptv_format_cache_file_path()
+    local file, err = io.open(path, "w")
+    if file then
+        file:write(utils.format_json({
+            version = 1,
+            formats = state.format_cache,
+        }))
+        file:close()
+        state.format_cache_dirty = false
+        return true
+    end
+    mp.msg.warn("无法保存 IPTV 格式缓存: " .. tostring(err))
+    return false
 end

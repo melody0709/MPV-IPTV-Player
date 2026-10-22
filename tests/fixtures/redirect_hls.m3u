@@ -1,0 +1,7 @@
+#EXTM3U
+#EXTINF:-1 tvg-id="integration" group-title="Integration",Redirect HLS Integration
+#EXTVLCOPT:http-user-agent=IntegrationUA/9.0
+#EXTVLCOPT:http-referrer=https://ref.integration/
+#EXTVLCOPT:http-origin=https://origin.integration
+#KODIPROP:inputstream.adaptive.manifest_type=hls
+http://127.0.0.1:18991/start|Cookie=sid%3Dintegration
