@@ -98,6 +98,12 @@ function M.parse_attributes(value)
     return attributes
 end
 
+local function parse_catchup_days(value)
+    local days = tonumber(value)
+    if days and days >= 0 and days < math.huge then return days end
+    return nil
+end
+
 local function parse_extinf(line)
     local payload = line:gsub("^#EXTINF:%s*", "", 1)
     local attribute_text, display_name = split_first_unquoted_comma(payload)
@@ -117,7 +123,9 @@ local function parse_extinf(line)
         attributes = attributes,
         tvg_id = trim(attributes["tvg-id"]),
         name = name,
-        catchup = trim(attributes["catchup-source"]),
+        catchup = attributes["catchup-source"] and trim(attributes["catchup-source"]),
+        catchup_type = attributes.catchup and trim(attributes.catchup):lower(),
+        catchup_days = parse_catchup_days(attributes["catchup-days"]),
         group = trim(attributes["group-title"]) ~= "" and trim(attributes["group-title"]) or "其他频道",
         logo = trim(attributes["tvg-logo"]),
         headers = headers,
@@ -314,7 +322,9 @@ local function append_source(result, channel_map, entry, pending, playlist_defau
         headers = headers,
         format = format,
         format_origin = format_origin,
-        catchup = entry.catchup,
+        catchup = entry.catchup or playlist_defaults.catchup or "",
+        catchup_type = entry.catchup_type or playlist_defaults.catchup_type,
+        catchup_days = entry.catchup_days or playlist_defaults.catchup_days,
         drm = drm,
     }
     source.id = source_model.source_identity_key(source)
@@ -327,7 +337,9 @@ local function append_source(result, channel_map, entry, pending, playlist_defau
             name = entry.name,
             url = source.url,
             tvg_id = entry.tvg_id,
-            catchup = entry.catchup,
+            catchup = source.catchup,
+            catchup_type = source.catchup_type,
+            catchup_days = source.catchup_days,
             logo = entry.logo,
             group = entry.group,
             sources = {},
@@ -354,8 +366,10 @@ local function append_source(result, channel_map, entry, pending, playlist_defau
         result.duplicate_source_count = result.duplicate_source_count + 1
     end
 
-    if channel.catchup == "" and entry.catchup ~= "" then
-        channel.catchup = entry.catchup
+    if channel.catchup == "" and source.catchup ~= "" then
+        channel.catchup = source.catchup
+        channel.catchup_type = source.catchup_type
+        channel.catchup_days = source.catchup_days
     end
     if channel.logo == "" and entry.logo ~= "" then
         channel.logo = entry.logo
@@ -399,6 +413,9 @@ function M.parse(content, options)
             playlist_defaults.headers = source_model.merge_headers(playlist_defaults.headers, headers)
             result.rejected_header_count = result.rejected_header_count + rejected
             playlist_defaults.format = source_model.format_from_attributes(attributes)
+            playlist_defaults.catchup = attributes["catchup-source"] and trim(attributes["catchup-source"])
+            playlist_defaults.catchup_type = attributes.catchup and trim(attributes.catchup):lower()
+            playlist_defaults.catchup_days = parse_catchup_days(attributes["catchup-days"])
         elseif line:match("^#EXTINF:") then
             if current_entry then
                 pending = new_pending_options()
@@ -423,7 +440,7 @@ function M.parse(content, options)
                 -- 菜单、日志或历史。内部 identity_key 仍区分不同真实 URL。
                 name = source_model.redact_url(bare_url),
                 identity_key = "url:" .. source_model.source_cache_key({url = bare_url, headers = {}}),
-                catchup = "",
+                catchup = nil,
                 group = "其他频道",
                 logo = "",
                 headers = {},

@@ -20,6 +20,7 @@
 |--------|------|------|
 | 菜单项 `subtitle` 字段 | 类型定义、尺寸计算、绘制区域 | 支持双行副标题（频道名下显示当前节目） |
 | 菜单级 `subtitle_font_size` / `menu_min_width` | 类型定义、宽度计算 | 按菜单级别独立控制副标题字号和最小宽度 |
+| 选中副标题跑马灯 | 类型定义、`get_subtitle_marquee_offset`、副标题绘制区域 | 菜单级 `subtitle_marquee` 开启后，仅选中且超宽的副标题横向滚动，切换条目重新计时 |
 | 移除默认子菜单右箭头 | 菜单序列化初始化区域 | 去掉所有子菜单默认 `>` 箭头，减少视觉噪音 |
 | 展开后居中滚动 | `activate_selected_item` 子菜单展开分支 | 展开后将 `selected_sub_index` 对应项滚动到可视中间 |
 | 日期桶悬停交互增强 | 类型定义、宽度计算、悬停交互 | 新增 `no_hover_expand`/`no_hover_select`，新增 `menu_max_width` 锁定列宽 |

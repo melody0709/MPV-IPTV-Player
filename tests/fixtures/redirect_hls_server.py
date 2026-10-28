@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 
 
 HOST = "127.0.0.1"
@@ -40,6 +40,7 @@ class Handler(BaseHTTPRequestHandler):
             json.dumps(
                 {
                     "path": path,
+                    "query": parse_qs(urlsplit(self.path).query),
                     "headers_ok": headers_ok,
                     "cookie_present": self.headers.get("Cookie") is not None,
                 },

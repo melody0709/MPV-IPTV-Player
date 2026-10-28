@@ -1201,10 +1201,21 @@ function parse_m3u(path, parse_options)
                 if resolved_channel then
                     local preferred_source_index = tonumber(last_channel.source_index) or 1
                     if last_channel.source_id and resolved_channel.sources then
+                        local exact_match = false
                         for source_index, source in ipairs(resolved_channel.sources) do
                             if source.id == last_channel.source_id then
                                 preferred_source_index = source_index
+                                exact_match = true
                                 break
+                            end
+                        end
+                        -- V1.9 历史身份不含 catchup 类型/天数，升级后仍按原 Header/URL 定位线路。
+                        if not exact_match then
+                            for source_index, source in ipairs(resolved_channel.sources) do
+                                if source_model.source_identity_key(source, true) == last_channel.source_id then
+                                    preferred_source_index = source_index
+                                    break
+                                end
                             end
                         end
                     end

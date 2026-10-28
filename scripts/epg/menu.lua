@@ -122,13 +122,15 @@ build_channel_epg_items = function(ch, programs)
     if epg_list and #epg_list > 0 then
         -- 回看资格判定延迟 2 分钟，兼容节目整点刚开始时的回看源稳定性
         local catchup_ready_utc = catchup_ready_utc_string()
+        local now_ts = os.time()
         for _, prog in ipairs(epg_list) do
             local epg_subtitle = prog.display_start
             if prog.display_end and prog.display_end ~= "" then
                 epg_subtitle = epg_subtitle .. " - " .. prog.display_end
             end
 
-            if ch.catchup ~= "" and ch.catchup:find("%$%{") and prog.start_utc ~= "" and prog.end_utc ~= "" and prog.start_utc <= catchup_ready_utc then
+            if prog.start_utc ~= "" and prog.end_utc ~= "" and prog.start_utc <= catchup_ready_utc
+                and channel_has_catchup(ch, prog.start_utc, now_ts) then
                 -- 延迟生成回看 URL：菜单构建阶段只传模板和时间参数，点击时再计算实际 URL
                 table.insert(epg_items, {
                     title = prog.title,
@@ -315,6 +317,7 @@ end
 
 function update_iptv_menu_items(items)
     local menu_level2_min_width = get_positive_integer_option(options.menu_level2_min_width)
+    local menu_level2_max_width = get_positive_integer_option(options.menu_level2_max_width)
     local menu_subtitle_font_size = get_positive_integer_option(options.menu_subtitle_font_size)
 
     local menu_data = {
@@ -332,6 +335,10 @@ function update_iptv_menu_items(items)
     if menu_level2_min_width then
         menu_data.menu_min_width = menu_level2_min_width
     end
+    if menu_level2_max_width then
+        menu_data.menu_max_width = menu_level2_max_width
+    end
+    menu_data.subtitle_marquee = options.menu_subtitle_marquee
     if menu_subtitle_font_size then
         menu_data.subtitle_font_size = menu_subtitle_font_size
     end
@@ -371,6 +378,7 @@ build_main_menu = function(preload_target)
     local menu_subtitle_font_size = get_positive_integer_option(options.menu_subtitle_font_size)
     local menu_level1_min_width = get_positive_integer_option(options.menu_level1_min_width)
     local menu_level2_min_width = get_positive_integer_option(options.menu_level2_min_width)
+    local menu_level2_max_width = get_positive_integer_option(options.menu_level2_max_width)
     local menu_level3_min_width = get_positive_integer_option(options.menu_level3_min_width)
     local menu_level4_min_width = get_positive_integer_option(options.menu_level4_min_width)
 
@@ -415,6 +423,10 @@ build_main_menu = function(preload_target)
         if menu_level2_min_width then
             group_item.menu_min_width = menu_level2_min_width
         end
+        if menu_level2_max_width then
+            group_item.menu_max_width = menu_level2_max_width
+        end
+        group_item.subtitle_marquee = options.menu_subtitle_marquee
         if menu_subtitle_font_size then
             group_item.subtitle_font_size = menu_subtitle_font_size
         end
@@ -589,35 +601,32 @@ function build_catchup_epg_menu()
     local temp_items = {}  -- 临时存储，包含排序键
     -- EPG 搜索菜单与三级菜单保持一致：节目开始 2 分钟后才显示为可回看
     local catchup_ready_utc = catchup_ready_utc_string()
+    local now_ts = os.time()
 
     -- 遍历所有频道组
     for group_name, channels in pairs(state.groups) do
         for _, ch in ipairs(channels) do
-            -- 检查频道是否有回看功能
-            local has_catchup = ch.catchup ~= "" and ch.catchup:find("%$%{")
-            if has_catchup then
-                local epg_list = state.epg_data[ch.tvg_id]
-                if epg_list then
-                    for _, prog in ipairs(epg_list) do
-                        -- 只显示开始时间早于当前时间 2 分钟的节目（可以回看）
-                        if prog.start_utc <= catchup_ready_utc then
-                            local catchup_url = ch.catchup
-                            -- 不在此处生成完整 URL，延迟到点击时生成
-                            local display_text = string.format("%s | %s | %s",
-                                ch.name, prog.display_start, prog.title)
+            local epg_list = ch.catchup and ch.catchup:find("{", 1, true) and state.epg_data[ch.tvg_id]
+            if epg_list then
+                for _, prog in ipairs(epg_list) do
+                    -- 只显示开始时间早于当前时间 2 分钟的节目（可以回看）
+                    if prog.start_utc ~= "" and prog.end_utc ~= "" and prog.start_utc <= catchup_ready_utc
+                        and channel_has_catchup(ch, prog.start_utc, now_ts) then
+                        -- 不在此处生成完整 URL，延迟到点击时生成
+                        local display_text = string.format("%s | %s | %s",
+                            ch.name, prog.display_start, prog.title)
 
-                            table.insert(temp_items, {
-                                start_utc = prog.start_utc,
-                                menu_item = {
-                                    title = display_text,
-                                    search_key = prog.title,  -- 只用于搜索的EPG标题
-                                    value = {"script-message-to", "epg", "play-catchup",
-                                        "", ch.catchup, prog.start_utc, prog.end_utc, ch.url, ch.key or ""},
-                                    hint = "回看",
-                                    icon = "history"
-                                }
-                            })
-                        end
+                        table.insert(temp_items, {
+                            start_utc = prog.start_utc,
+                            menu_item = {
+                                title = display_text,
+                                search_key = prog.title,  -- 只用于搜索的EPG标题
+                                value = {"script-message-to", "epg", "play-catchup",
+                                    "", ch.catchup, prog.start_utc, prog.end_utc, ch.url, ch.key or ""},
+                                hint = "回看",
+                                icon = "history"
+                            }
+                        })
                     end
                 end
             end

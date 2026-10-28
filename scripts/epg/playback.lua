@@ -605,45 +605,63 @@ function find_channel_source_index_by_url(channel, url)
     return best_index
 end
 
-function build_catchup_playback_sources(channel, start_utc, end_utc, requested_template, requested_url)
-    local result = {}
-    local live_sources = channel and channel.sources or {}
+local function catchup_metadata(source, channel, requested_template)
+    local template = source.catchup
+    local inherited = not template or template == ""
+    if inherited then template = requested_template or (channel and channel.catchup) end
+    return template,
+        source.catchup_type or (inherited and channel and channel.catchup_type) or nil,
+        source.catchup_days or (inherited and channel and channel.catchup_days) or nil
+end
 
-    if #live_sources == 0 and requested_url and requested_url ~= "" then
-        local source = source_model.make_source(requested_url, {headers = {}, catchup = requested_template})
-        source.original_source_index = 1
-        return {source}
+function channel_has_catchup(channel, start_utc, now_ts)
+    local sources = channel.sources or {}
+    if #sources == 0 then sources = {channel} end
+    for _, source in ipairs(sources) do
+        local template, mode, days = catchup_metadata(source, channel, channel.catchup)
+        if mode ~= "none" and template and template:find("{", 1, true)
+            and catchup_time_in_window(start_utc, days, now_ts) then
+            return true
+        end
     end
+    return false
+end
+
+function build_catchup_playback_sources(channel, start_utc, end_utc, requested_template, requested_url, fallback_source)
+    local result, failure = {}, "频道没有可用的回看模板"
+    local live_sources = channel and channel.sources or {}
+    if #live_sources == 0 then live_sources = {fallback_source or channel or {headers = {}}} end
 
     for source_index, live_source in ipairs(live_sources) do
-        local template = live_source.catchup
-        if not template or template == "" then
-            template = requested_template
+        local template, mode, days = catchup_metadata(live_source, channel, requested_template)
+        local live_url = live_source.live_url or live_source.url
+        local playback_url, error_message
+        if mode == "none" then
+            error_message = "频道未启用回看"
+        elseif start_utc and not catchup_time_in_window(start_utc, days) then
+            error_message = "节目超出回看天数范围或时间无效"
+        elseif template and template ~= "" and start_utc and end_utc then
+            playback_url, error_message = build_catchup_url(live_url, template, mode, start_utc, end_utc,
+                options.catchup_local_timezone_override)
+        elseif requested_url and requested_url ~= "" then
+            playback_url = requested_url
         end
-        if template and template ~= "" then
-            local playback_url
-            if start_utc and end_utc then
-                playback_url = replace_catchup_time_params(template, start_utc, end_utc)
-            elseif requested_url and requested_url ~= "" then
-                playback_url = requested_url
-            end
-            if playback_url and playback_url ~= "" then
-                local source = source_model.make_source(playback_url, live_source)
-                source.catchup = template
-                source.id = source_model.source_identity_key(source)
-                source.original_source_index = source_index
-                result[#result + 1] = source
-            end
+        if playback_url and not source_model.is_media_url(playback_url) then
+            playback_url, error_message = nil, "回看地址不是完整的媒体 URL"
         end
+        if playback_url then
+            local source = source_model.make_source(playback_url, live_source)
+            source.catchup, source.catchup_type, source.catchup_days = template, mode, days
+            source.live_url = live_url
+            source.id = source_model.source_identity_key(source)
+            source.original_source_index = live_source.original_source_index or source_index
+            result[#result + 1] = source
+        end
+        failure = error_message or failure
     end
-
-    if #result == 0 and requested_url and requested_url ~= "" then
-        local base_source = get_channel_source(channel, state.current_source_index)
-        local source = source_model.make_source(requested_url, base_source or {headers = {}})
-        source.catchup = requested_template
-        source.id = source_model.source_identity_key(source)
-        source.original_source_index = tonumber(state.current_source_index) or 1
-        result[1] = source
+    if #result == 0 then
+        mp.msg.warn("回看失败：" .. failure)
+        mp.osd_message("回看失败：" .. failure, 4)
     end
     return result
 end

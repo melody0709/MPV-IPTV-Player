@@ -15,6 +15,7 @@ options = {
     epg_cache_refresh_start = "00:04",
     epg_cache_refresh_interval_hours = 7,
     catchup_preload_seconds = 15,
+    catchup_local_timezone_override = "",
     iptv_default_user_agent = "SYTV/1.6",
     iptv_network_timeout = 8,
     iptv_retry_count = 2,
@@ -22,8 +23,10 @@ options = {
     iptv_format_fallback = true,
     iptv_source_fallback = true,
     menu_subtitle_font_size = 0,
+    menu_subtitle_marquee = true,
     menu_level1_min_width = 0,
     menu_level2_min_width = 0,
+    menu_level2_max_width = 0,
     menu_level3_min_width = 0,
     menu_level4_min_width = 0
 }
@@ -153,7 +156,6 @@ channel_search_cache = {}
 xmltv_utc_cache = {}
 utc_timestamp_cache = {}
 display_date_cache = {}
-timezone_offset_cache = {}
 local_day_start_cache = {}
 top_center_osd_timer = nil
 history_save_timer = nil
@@ -297,7 +299,6 @@ local function perform_catchup_preload_check()
         return
     end
 
-    local new_url = replace_catchup_time_params(cc.catchup_template, next_start_utc, next_end_utc)
     local queued_context = {
         live_url = cc.live_url,
         catchup_template = cc.catchup_template,
@@ -315,8 +316,10 @@ local function perform_catchup_preload_check()
         next_start_utc,
         next_end_utc,
         cc.catchup_template,
-        new_url
+        nil,
+        cc.source or {url = cc.live_url}
     )
+    if #sources == 0 then return end
     local loaded, queued_session = load_iptv_sources(sources, "catchup-preload", {
         role = "catchup",
         channel = catchup_channel,
@@ -329,6 +332,7 @@ local function perform_catchup_preload_check()
     end
 
     queued_context.source = queued_session.current_attempt.source
+    queued_context.catchup_template = queued_context.source.catchup
     queued_context.source_index = queued_session.current_attempt.source_index
     set_queued_catchup_state(queued_context, queued_session.current_attempt.source.url)
     mp.msg.info(string.format("回看预加载: 已提前排队下一段 start=%s end=%s", next_start_utc, next_end_utc))
@@ -412,11 +416,6 @@ mp.register_script_message("play-catchup", function(catchup_url, catchup_templat
         return
     end
 
-    -- 如果菜单构建阶段没有预先计算 URL，则在点击时再根据模板即时生成（避免菜单打开时大量 gsub）
-    if not catchup_url or catchup_url == "" then
-        catchup_url = replace_catchup_time_params(catchup_template, start_utc, end_utc)
-    end
-
     local catchup_channel
     if channel_key and channel_key ~= "" then
         catchup_channel = find_channel_by_key(channel_key)
@@ -434,26 +433,29 @@ mp.register_script_message("play-catchup", function(catchup_url, catchup_templat
         start_utc,
         end_utc,
         catchup_template,
-        catchup_url
+        catchup_url,
+        {url = live_url}
     )
+    if #catchup_sources == 0 then return end
 
-    local loaded = load_iptv_sources(catchup_sources, "catchup", {
+    local loaded, session = load_iptv_sources(catchup_sources, "catchup", {
         role = "catchup",
         channel = catchup_channel,
         preferred_source_index = preferred_source_index,
     })
     if not loaded then return end
+    local attempt = session.current_attempt
 
     set_current_catchup_state({
         live_url         = live_url,
-        catchup_template = catchup_template,
+        catchup_template = attempt.source.catchup,
         start_utc        = start_utc,
         last_end_utc     = end_utc,
         last_duration    = nil,
         channel          = catchup_channel,
-        source           = catchup_sources[preferred_source_index] or catchup_sources[1],
-        source_index     = preferred_source_index,
-    }, catchup_url)
+        source           = attempt.source,
+        source_index     = attempt.source_index,
+    }, attempt.source.url)
 
     if catchup_channel then
         set_current_channel_state(catchup_channel)
@@ -718,30 +720,31 @@ mp.register_event("end-file", function(event)
         return
     end
 
-    local new_url = replace_catchup_time_params(cc.catchup_template, next_start_utc, next_end_utc)
     mp.msg.info(string.format("回看续播: start_utc %s -> %s, end_utc -> %s", cc.start_utc, next_start_utc, next_end_utc))
-    mp.msg.info("回看续播调试: new_url=" .. redact_iptv_url(new_url))
     mp.osd_message(string.format("回看续播中... 已延伸至 %s:%s",
         next_end_utc:sub(9,10), next_end_utc:sub(11,12)), 3)
 
-    cc.start_utc = next_start_utc
-    cc.last_end_utc = next_end_utc
     local catchup_channel = cc.channel or find_channel_by_url(cc.live_url)
     local sources = build_catchup_playback_sources(
         catchup_channel,
         next_start_utc,
         next_end_utc,
         cc.catchup_template,
-        new_url
+        nil,
+        cc.source or {url = cc.live_url}
     )
+    if #sources == 0 then return end
     local loaded, session = load_iptv_sources(sources, "catchup-resume", {
         role = "catchup",
         channel = catchup_channel,
         preferred_source_index = cc.source_index or state.current_source_index or 1,
     })
     if loaded and session and session.current_attempt then
+        cc.start_utc = next_start_utc
+        cc.last_end_utc = next_end_utc
         cc.channel = catchup_channel
         cc.source = session.current_attempt.source
+        cc.catchup_template = cc.source.catchup
         cc.source_index = session.current_attempt.source_index
         set_current_catchup_state(cc, session.current_attempt.source.url)
     else

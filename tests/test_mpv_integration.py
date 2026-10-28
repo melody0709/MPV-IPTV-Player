@@ -16,6 +16,7 @@ FIXTURES = ROOT / "tests" / "fixtures"
 SERVER = FIXTURES / "redirect_hls_server.py"
 PLAYLIST = FIXTURES / "redirect_hls.m3u"
 CONTROLLER = FIXTURES / "integration_controller.lua"
+CATCHUP_CONTROLLER = FIXTURES / "catchup_controller.lua"
 QUIT_CONTROLLER = FIXTURES / "quit_controller.lua"
 HOST = "127.0.0.1"
 PORT = 18991
@@ -122,6 +123,26 @@ def main() -> int:
                 check=False,
             )
             assert_mpv_ok(completed, "mpv redirect/HLS integration run")
+
+            catchup_playlist = config_path / "catchup.m3u"
+            catchup_playlist.write_text(
+                PLAYLIST.read_text(encoding="utf-8").replace(
+                    "#EXTM3U",
+                    '#EXTM3U catchup="append" catchup-source="?playseek=${(b)yyyyMMddHHmmss}-${(e)yyyyMMddHHmmss}"',
+                    1,
+                ).replace("/start|", "/start?channel=13|"),
+                encoding="utf-8",
+            )
+            catchup_completed = subprocess.run(
+                [
+                    str(mpv), str(catchup_playlist), f"--script={CATCHUP_CONTROLLER}",
+                    "--script-opts=epg-catchup_local_timezone_override=+08:00,epg-iptv_retry_count=0",
+                    *common_options,
+                ],
+                cwd=ROOT, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, encoding="utf-8", errors="replace", timeout=12, check=False,
+            )
+            assert_mpv_ok(catchup_completed, "mpv append catchup integration run")
     finally:
         if server.poll() is None:
             server.terminate()
@@ -167,9 +188,18 @@ def main() -> int:
             f"invalid={invalid}, server_stderr={server_stderr.strip()}"
         )
 
+    if not any(
+        record.get("path") == "/start"
+        and record.get("query", {}).get("channel") == ["13"]
+        and record.get("query", {}).get("playseek") == ["20261021200000-20261021210000"]
+        for record in records
+    ):
+        raise RuntimeError("append catchup did not preserve the live query and convert UTC to +08:00")
+
     print(
         "PASS mpv integration: local M3U intercepted before native expansion; "
-        "302 -> HLS manifest -> TS segment all inherited source headers"
+        "302 -> HLS manifest -> TS segment all inherited source headers; "
+        "APTV append catchup preserved query, +08:00 time and catchup state"
     )
     return 0
 

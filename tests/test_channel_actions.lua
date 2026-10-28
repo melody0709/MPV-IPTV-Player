@@ -1,5 +1,5 @@
 return function()
-    local messages, observers, commands = {}, {}, {}
+    local messages, observers, commands, events, timers, properties = {}, {}, {}, {}, {}, {}
     local function noop() end
     package.loaded.mp = {
         msg = {info = noop, warn = noop, error = noop, verbose = noop},
@@ -10,15 +10,22 @@ return function()
             commands[#commands + 1] = command
         end,
         commandv = noop,
-        get_property = function(_, default) return default end,
-        get_property_number = noop,
+        get_property = function(name, default) return properties[name] or default end,
+        get_property_number = function(name) return tonumber(properties[name]) end,
         set_property_native = noop,
         register_script_message = function(name, callback) messages[name] = callback end,
-        register_event = noop,
+        register_event = function(name, callback)
+            events[name] = events[name] or {}
+            events[name][#events[name] + 1] = callback
+        end,
         observe_property = function(name, _, callback) observers[name] = callback end,
         add_key_binding = noop,
         add_hook = noop,
-        add_timeout = function(_, callback) return {callback = callback, kill = noop} end,
+        add_timeout = function(_, callback)
+            local timer = {callback = callback, kill = noop}
+            timers[#timers + 1] = timer
+            return timer
+        end,
         osd_message = noop,
     }
     package.loaded["mp.utils"] = {
@@ -228,4 +235,71 @@ https://lines.test/live.php
     assert(state.active_attempt.source.id == source_x_id)
     assert(state.current_source_index == nil, "removed source must not reuse its old positional index")
     assert(state.channel_history[get_m3u_key(state.m3u_path)] == history_before_removal)
+
+    -- append 的备用线路、路径保护、预加载和 EOF 续播必须共用实际 source。
+    local append_playlist = [[
+#EXTM3U catchup="append" catchup-source="?playseek=${(b)yyyyMMddHHmmss}-${(e)yyyyMMddHHmmss}"
+#EXTINF:-1 tvg-id="append" group-title="TV",Append
+#EXTVLCOPT:http-user-agent=UA-1
+https://append.test/live?channel=one&token=first
+#EXTINF:-1 tvg-id="append" group-title="TV",Append
+#EXTVLCOPT:http-user-agent=UA-2
+https://append.test/live?channel=two&token=second
+]]
+    parse_refresh(append_playlist, false)
+    options.catchup_local_timezone_override = "+08:00"
+    local append_channel = state.groups.TV[1]
+    assert(play_live_channel(append_channel, false, "TV", 1, 2))
+    messages["play-catchup"]("", append_channel.catchup, "20200101010000", "20200101020000",
+        append_channel.url, append_channel.key)
+    local prefix = "https://append.test/live?channel=two&token=second&playseek="
+    assert(state.active_attempt.source.url == prefix .. "20200101090000-20200101100000")
+    assert(state.current_catchup_path == state.active_attempt.source.url)
+    assert(state.current_catchup.source_index == 2)
+    observers.path("path", state.current_catchup_path)
+    assert(state.current_catchup and state.current_channel == append_channel)
+
+    properties.duration = 3600
+    observers.duration("duration", 3600)
+    observers["time-pos"]("time-pos", 3590)
+    timers[#timers].callback()
+    assert(state.queued_catchup_path == prefix .. "20200101100000-20200101150000")
+    assert(state.queued_catchup.source.headers["User-Agent"] == "UA-2")
+    assert(commands[#commands][3] == "insert-next")
+
+    clear_queued_catchup_state()
+    for _, callback in ipairs(events["end-file"]) do callback({reason = "eof"}) end
+    assert(state.current_catchup_path == prefix .. "20200101100000-20200101150000")
+    assert(state.current_catchup.start_utc == "20200101020000")
+    assert(state.current_catchup.source.headers["User-Agent"] == "UA-2")
+
+    local old_attempt, old_context, old_commands = state.active_attempt, state.current_catchup, #commands
+    messages["play-catchup"]("", "?playseek=${unsupported}", "20200101010000", "20200101020000",
+        "https://unknown.test/live")
+    assert(state.active_attempt == old_attempt and state.current_catchup == old_context and #commands == old_commands)
+
+    -- 日期菜单与 F9 按各线路的窗口取可用并集。
+    append_channel.sources[1].catchup_days = 1
+    append_channel.sources[2].catchup_days = 7
+    local now = os.time()
+    local recent, expired = program("Recent"), program("Expired")
+    recent.start_utc, recent.end_utc = to_utc_string(now - 2 * 86400), to_utc_string(now - 2 * 86400 + 3600)
+    expired.start_utc, expired.end_utc = to_utc_string(now - 8 * 86400), to_utc_string(now - 8 * 86400 + 3600)
+    state.epg_data = {append = {recent, expired}}
+    local items = build_channel_epg_items(append_channel)
+    assert(not items[1].muted and items[2].muted)
+    local search = build_catchup_epg_menu()
+    assert(#search.items == 1 and search.items[1].title:find("Recent", 1, true))
+    assert(play_live_channel(append_channel, false, "TV", 1, 1))
+    invoke(items[1].value)
+    assert(state.current_catchup.source_index == 2, "expired first source must retain the backup's original index")
+    assert(state.active_attempt.source.headers["User-Agent"] == "UA-2")
+
+    -- 新增回看元数据后的历史恢复仍识别旧 source.id，不依赖已过时的序号。
+    state.channel_history[get_m3u_key(state.m3u_path)] = {
+        url = append_channel.url, channel_key = append_channel.key, source_index = 1,
+        source_id = require('source').source_identity_key(append_channel.sources[2], true),
+    }
+    assert(parse_m3u("test.m3u", {content = append_playlist, skip_epg_refresh = true}))
+    assert(state.current_source_index == 2 and state.active_attempt.source.headers["User-Agent"] == "UA-2")
 end

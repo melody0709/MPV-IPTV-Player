@@ -3,13 +3,13 @@ local Element = require('elements/Element')
 ---@alias MenuAction {name: string; icon: string; label?: string; filter_hidden?: boolean;}
 
 -- Menu data structure accepted by `Menu:open(menu)`.
----@alias MenuData {id?: string; type?: string; title?: string; hint?: string; footnote: string; search_style?: 'on_demand' | 'palette' | 'disabled';  item_actions?: MenuAction[]; item_actions_place?: 'inside' | 'outside'; callback?: string[]; keep_open?: boolean; bold?: boolean; italic?: boolean; muted?: boolean; separator?: boolean; align?: 'left'|'center'|'right'; menu_min_width?: number; menu_max_width?: number; subtitle_font_size?: number; items?: MenuDataChild[]; selected_index?: integer; on_search?: string|string[]; on_paste?: string|string[]; on_move?: string|string[]; on_close?: string|string[]; search_debounce?: number|string; search_submenus?: boolean; search_suggestion?: string; search_submit?: boolean; bind_keys?: string[]}
+---@alias MenuData {id?: string; type?: string; title?: string; hint?: string; footnote: string; search_style?: 'on_demand' | 'palette' | 'disabled';  item_actions?: MenuAction[]; item_actions_place?: 'inside' | 'outside'; callback?: string[]; keep_open?: boolean; bold?: boolean; italic?: boolean; muted?: boolean; separator?: boolean; align?: 'left'|'center'|'right'; menu_min_width?: number; menu_max_width?: number; subtitle_font_size?: number; subtitle_marquee?: boolean; items?: MenuDataChild[]; selected_index?: integer; on_search?: string|string[]; on_paste?: string|string[]; on_move?: string|string[]; on_close?: string|string[]; search_debounce?: number|string; search_submenus?: boolean; search_suggestion?: string; search_submit?: boolean; bind_keys?: string[]}
 ---@alias MenuDataChild MenuDataItem|MenuData
 ---@alias MenuDataItem {title?: string; subtitle?: string; hint?: string; icon?: string; value: any; actions?: MenuAction[]; actions_place?: 'inside' | 'outside'; active?: boolean; keep_open?: boolean; no_hover_expand?: boolean; no_hover_select?: boolean; selectable?: boolean; bold?: boolean; italic?: boolean; muted?: boolean; separator?: boolean; align?: 'left'|'center'|'right'; selected_sub_index?: integer}
 ---@alias MenuOptions {mouse_nav?: boolean; anchor_x?: 'left'|'center'|'right'; anchor_offset?: number;}
 
 -- Internal data structure created from `MenuData`.
----@alias MenuStack {id?: string; type?: string; title?: string; hint?: string; footnote: string; search_style?: 'on_demand' | 'palette' | 'disabled';  item_actions?: MenuAction[]; item_actions_place?: 'inside' | 'outside'; callback?: string[]; selected_index?: number; action_index?: number; keep_open?: boolean; bold?: boolean; italic?: boolean; muted?: boolean; separator?: boolean; align?: 'left'|'center'|'right'; menu_min_width?: number; menu_max_width?: number; subtitle_font_size?: number; subtitle_font_size_resolved?: number; items: MenuStackChild[]; on_search?: string|string[]; on_paste?: string|string[]; on_move?: string|string[]; on_close?: string|string[]; search_debounce?: number|string; search_submenus?: boolean; search_suggestion?: string; search_submit?: boolean; bind_keys?: string[]; parent_menu?: MenuStack; submenu_path: integer[]; active?: boolean; width: number; height: number; top: number; scroll_y: number; scroll_height: number; title_width: number; hint_width: number; max_width: number; is_root?: boolean; fling?: Fling, search?: Search, ass_safe_title?: string}
+---@alias MenuStack {id?: string; type?: string; title?: string; hint?: string; footnote: string; search_style?: 'on_demand' | 'palette' | 'disabled';  item_actions?: MenuAction[]; item_actions_place?: 'inside' | 'outside'; callback?: string[]; selected_index?: number; action_index?: number; keep_open?: boolean; bold?: boolean; italic?: boolean; muted?: boolean; separator?: boolean; align?: 'left'|'center'|'right'; menu_min_width?: number; menu_max_width?: number; subtitle_font_size?: number; subtitle_marquee?: boolean; subtitle_font_size_resolved?: number; items: MenuStackChild[]; on_search?: string|string[]; on_paste?: string|string[]; on_move?: string|string[]; on_close?: string|string[]; search_debounce?: number|string; search_submenus?: boolean; search_suggestion?: string; search_submit?: boolean; bind_keys?: string[]; parent_menu?: MenuStack; submenu_path: integer[]; active?: boolean; width: number; height: number; top: number; scroll_y: number; scroll_height: number; title_width: number; hint_width: number; max_width: number; is_root?: boolean; fling?: Fling, search?: Search, ass_safe_title?: string}
 ---@alias MenuStackChild MenuStackItem|MenuStack
 ---@alias MenuStackItem {title?: string; subtitle?: string; hint?: string; icon?: string; value: any; actions?: MenuAction[]; actions_place?: 'inside' | 'outside'; active?: boolean; keep_open?: boolean; selectable?: boolean; bold?: boolean; italic?: boolean; muted?: boolean; separator?: boolean; align?: 'left'|'center'|'right'; selected_sub_index?: integer; title_width: number; subtitle_width: number; hint_width: number; ass_safe_hint?: string; ass_safe_subtitle?: string}
 ---@alias Fling {y: number, distance: number, time: number, easing: fun(x: number), duration: number, update_cursor?: boolean}
@@ -136,6 +136,9 @@ function Menu:init(data, callback, opts)
 	self.is_closing = false
 	self.drag_last_y = nil
 	self.is_dragging = false
+	-- 【新增】频道当前节目副标题跑马灯状态
+	self.subtitle_marquee_key = nil
+	self.subtitle_marquee_started_at = nil
 
 	if utils.shared_script_property_set then
 		utils.shared_script_property_set('uosc-menu-type', self.type or 'undefined')
@@ -1493,6 +1496,37 @@ function Menu:command_or_event(command, params, event)
 	return nil
 end
 
+-- 【新增】计算选中副标题的横向滚动偏移；短文本保持静止，切换条目后重新计时
+---@param menu MenuStack
+---@param index integer
+---@param item MenuStackItem
+---@param available_width number
+---@return number offset
+---@return boolean active
+function Menu:get_subtitle_marquee_offset(menu, index, item, available_width)
+	local key = (menu.id or '') .. '\n' .. tostring(index) .. '\n' .. (item.subtitle or '')
+	if self.subtitle_marquee_key ~= key then
+		self.subtitle_marquee_key = key
+		self.subtitle_marquee_started_at = state.render_last_time
+	end
+
+	local overflow = item.subtitle_width - available_width
+	if overflow <= 0 then return 0, false end
+
+	local start_pause, end_pause = 0.5, 0.5
+	local speed = math.max(1, 40 * state.scale)
+	local travel_duration = overflow / speed
+	local cycle_duration = start_pause + travel_duration + end_pause
+	local elapsed = (state.render_last_time - self.subtitle_marquee_started_at) % cycle_duration
+
+	if elapsed < start_pause then
+		return 0, true
+	elseif elapsed < start_pause + travel_duration then
+		return overflow * (elapsed - start_pause) / travel_duration, true
+	end
+	return overflow, true
+end
+
 function Menu:render()
 	for _, menu in ipairs(self.all) do
 		if menu.fling then
@@ -1834,14 +1868,24 @@ function Menu:render()
 			-- 【新增】支持菜单项第二行副标题（用于 IPTV 当前节目）
 			if has_subtitle and subtitle_y then
 				item.ass_safe_subtitle = item.ass_safe_subtitle or ass_escape(item.subtitle)
-				local clip = '\\clip(' .. content_rect.ax .. ',' .. math.max(item_ay, content_rect.ay) .. ','
-					.. title_clip_bx .. ',' .. math.min(item_by, content_rect.by) .. ')'
 				local title_x, align = content_ax, 4
 				if item.align == 'right' then
 					title_x, align = title_clip_bx, 6
 				elseif item.align == 'center' then
 					title_x, align = content_ax + (title_clip_bx - content_ax) / 2, 5
 				end
+				-- 【新增】仅选中且超宽的左对齐副标题执行跑马灯，避免整列文字同时滚动
+				local clip_ax = content_rect.ax
+				if menu.subtitle_marquee and is_selected and align == 4 then
+					clip_ax = content_ax
+					local offset, marquee_active = self:get_subtitle_marquee_offset(
+						menu, index, item, math.max(0, title_clip_bx - content_ax)
+					)
+					title_x = title_x - offset
+					if marquee_active then request_render() end
+				end
+				local clip = '\\clip(' .. clip_ax .. ',' .. math.max(item_ay, content_rect.ay) .. ','
+					.. title_clip_bx .. ',' .. math.min(item_by, content_rect.by) .. ')'
 				ass:txt(title_x, subtitle_y, align, item.ass_safe_subtitle, {
 					size = subtitle_font_size,
 					color = font_color,

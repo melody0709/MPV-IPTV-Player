@@ -429,7 +429,7 @@ end
 
 -- source.id 用于历史恢复和线路身份，必须覆盖所有会改变播放语义的字段。
 -- format_cache_key 则继续单独使用 URL + Header，避免把两个用途混在一起。
-function M.source_identity_key(source)
+function M.source_identity_key(source, legacy_catchup)
     if type(source) ~= "table" then
         return "src:" .. M.hash_string("") .. M.hash_string("source-identity")
     end
@@ -442,6 +442,15 @@ function M.source_identity_key(source)
     end
     append_identity_part(parts, "format", M.normalize_format(source.format) or trim(source.format))
     append_identity_part(parts, "catchup", source.catchup)
+    local catchup_type = trim(source.catchup_type):lower()
+    if catchup_type == "" and trim(source.catchup):match("^[?&]") then catchup_type = "append" end
+    -- 缺省/default 完整地址沿用旧 id，避免已有订阅的历史线路身份变化。
+    if not legacy_catchup and catchup_type ~= "" and catchup_type ~= "default" then
+        append_identity_part(parts, "catchup-type", catchup_type)
+    end
+    if not legacy_catchup and source.catchup_days ~= nil then
+        append_identity_part(parts, "catchup-days", source.catchup_days)
+    end
     append_identity_part(parts, "drm-type", source.drm and M.normalize_drm_type(source.drm.type) or "")
     append_identity_part(parts, "drm-license", source.drm and source.drm.license_key or "")
     for _, name in ipairs(sorted_keys(source.file_options or {})) do

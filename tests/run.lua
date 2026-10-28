@@ -3,6 +3,7 @@ package.path = "./scripts/epg/?.lua;./?.lua;" .. package.path
 local test_files = {
     "tests/test_source.lua",
     "tests/test_m3u.lua",
+    "tests/test_catchup.lua",
     "tests/test_data_index.lua",
     "tests/test_playback.lua",
     "tests/test_channel_actions.lua",

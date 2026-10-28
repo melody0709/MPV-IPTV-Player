@@ -129,7 +129,7 @@ portable_config/
 - 自动加载 `x-tvg-url` EPG（xml/xml.gz）
 - 支持 `m3u_download_url` 远程订阅缓存启动与后台刷新
 - 支持频道级 Header、格式、DRM 元数据与同频道多 source
-- 支持 `catchup-source` 3 种回看模板
+- 支持 APTV/KU9/UTC 回看模板、append 拼接和逐线路回看天数限制
 - 支持 `epg_history.json` 记录最后播放频道（每个 m3u）
 
 ## M3U 模板
@@ -151,6 +151,8 @@ http://your-stream-url/play.php?id=cctv1|User-Agent=FinalUA%2F3.0&Referer=https%
 - `tvg-id`：频道 ID（与 EPG channel id 关联）
 - `group-title`：频道分组
 - `catchup-source`：回看 URL 模板
+- `catchup`：`append` 将后缀拼接到当前线路的直播 URL，`default` 使用完整回看 URL，`none` 禁用回看；缺省时自动识别以 `?`/`&` 开头的后缀
+- `catchup-days`：各线路的回看窗口（天）；日期菜单将过期节目标为不可回看，F9 搜索与播放入口排除过期回看；未声明时不额外限制。上述回看属性也支持在 `#EXTM3U` 中设置默认值
 - `#EXTVLCOPT:http-*`：VLC 风格的 UA、Referer、Origin、Cookie 或自定义 Header
 - `#EXTHTTP`：JSON Header 对象，也支持 `{ "headers": {...} }`
 - `#KODIPROP`：Kodi adaptive Header、`manifest_type`、MIME 和 DRM license 元数据
@@ -251,15 +253,19 @@ iptv_source_fallback=yes
 
 # IPTV 菜单 UI 配置（0=沿用 uosc.conf）
 menu_subtitle_font_size=0
+menu_subtitle_marquee=yes
 menu_level1_min_width=0
 menu_level2_min_width=0
+menu_level2_max_width=0
 menu_level3_min_width=0
 menu_level4_min_width=0
 ```
 
 - `menu_subtitle_font_size`：二级/三级菜单副标题字体大小（频道当前节目、日期桶日期）
+- `menu_subtitle_marquee`：频道当前节目超出可用宽度时，选中项自动横向滚动
 - `menu_level1_min_width`：一级菜单（分组）最小宽度
 - `menu_level2_min_width`：二级菜单（频道）最小宽度
+- `menu_level2_max_width`：二级菜单（频道）最大宽度，`0` 为不限制
 - `menu_level3_min_width`：三级菜单（日期桶）最小宽度
 - `menu_level4_min_width`：四级菜单（EPG）最小宽度
 - `catchup_preload_seconds`：回看片段剩余多少秒时，提前把下一段插入播放列表；默认 `15`
@@ -298,10 +304,14 @@ menu_level4_min_width=0
 
 1. **检查 `catchup-source` 格式**
 
-   - 支持以下三种时间参数格式：
+   - 保持兼容的 UTC 时间格式：
      - **标准回看模板**: `${utc:yyyyMMddHHmmss}` 和 `${utcend:yyyyMMddHHmmss}`
      - **KU9回看模板**: `${(b)yyyyMMddHHmmss|UTC}` 和 `${(e)yyyyMMddHHmmss|UTC}`
      - **APTV回看模板**: `${(b)yyyyMMddHHmmss:utc}` 和 `${(e)yyyyMMddHHmmss:utc}`
+   - APTV 无后缀 `${(b)yyyyMMddHHmmss}` / `${(e)yyyyMMddHHmmss}` 使用设备本地时间；可在 `myepg.conf` 设置 `catchup_local_timezone_override=+08:00`，让无后缀宏按北京时间生成。发布默认值留空
+   - 显式 `|Local`、`|UTC`、`:utc`、`|GMT+8`、`|+08:00` 优先于配置。支持 `yyyy`/`MM`/`dd`/`HH`/`mm`/`ss` 及常用标点分隔，不支持 IANA 时区名
+   - 也支持 `${(b)timestamp}` / `${(e)timestamp}`、`{utc:YmdHMS}` / `{utcend:YmdHMS}`、`{utc}` / `{utcend}` / `{lutc}` / `{duration}`，以及 `{url}` 直播地址占位符。时间戳均为 Unix 秒，`lutc` 为当前时间，`duration` 为节目秒数
+   - 例如 `catchup="append" catchup-days="7" catchup-source="?playseek=${(b)yyyyMMddHHmmss}-${(e)yyyyMMddHHmmss}"`；已有直播 query 和线路 Header 会保留，无法解析的模板会显示错误提示
 2. **检查时间格式**
 
    - 确保 EPG 中的 `start` 和 `stop` 时间是标准 XMLTV 格式
@@ -352,13 +362,13 @@ luac -p scripts/epg/source.lua scripts/epg/m3u.lua scripts/epg/utils.lua scripts
 python tests/test_mpv_integration.py
 ```
 
-最后一条命令使用隔离临时配置运行真实 mpv。`tests/fixtures/redirect_hls_server.py` 与 `redirect_hls.m3u` 会构造本地 M3U 接管、302、HLS 主清单和 TS 分片，并逐请求验证 UA、Referer、Origin、Cookie 是否传递；只要出现任何脱离 descriptor 的无 Header 请求，测试就会失败。测试服务只在运行期间监听 `127.0.0.1:18991`。
+最后一条命令使用隔离临时配置运行真实 mpv，验证本地 M3U 接管、302 → HLS → TS 全请求 Header 传播，以及 APTV append 回看的原 query、北京时间参数和回看状态保护；也在 mpv 自带 Lua 中验证 UTC/DST 转换。测试服务只在运行期间监听 `127.0.0.1:18991`。
 
 ## 版本信息
 
 - **基础版本**：uosc 5.12.0
-- **IPTV 版本**：V1.9.0（2026-07-12）
-- **最后更新**：2026-07-12
+- **IPTV 版本**：V1.10.0（2026-10-22）
+- **最后更新**：2026-10-22
 
 ## 🤝 致谢
 

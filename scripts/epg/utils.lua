@@ -91,33 +91,19 @@ function get_local_date_cache_key(ts)
     return string.format("%04d-%02d-%02d", dt.year, dt.month, dt.day)
 end
 
-function get_local_timezone_offset(reference_ts)
-    local cache_key = get_local_date_cache_key(reference_ts)
-    local cached_offset = timezone_offset_cache[cache_key]
-    if cached_offset ~= nil then
-        return cached_offset
-    end
-
-    local base_ts = reference_ts or os.time()
-    local local_offset = os.difftime(
-        os.time(os.date("*t", base_ts)),
-        os.time(os.date("!*t", base_ts))
-    )
-    timezone_offset_cache[cache_key] = local_offset
-    return local_offset
-end
-
 function xmltv_to_utc(time_str)
+    if type(time_str) ~= "string" then return "" end
     local cached_utc = xmltv_utc_cache[time_str]
     if cached_utc ~= nil then return cached_utc end
 
-    local y, m, d, h, min, s, sign, offset_h, offset_m = time_str:match("^(%d%d%d%d)(%d%d)(%d%d)(%d%d)(%d%d)(%d%d) ([%+%-])(%d%d)(%d%d)")
-    if not y then return "" end
-    local t = os.time{year=y, month=m, day=d, hour=h, min=min, sec=s}
-    t = t + get_local_timezone_offset(t)
+    local date, sign, offset_h, offset_m = time_str:match("^(%d%d%d%d%d%d%d%d%d%d%d%d%d%d)%s+([%+%-])(%d%d)(%d%d)")
+    if not date or tonumber(offset_h) > 23 or tonumber(offset_m) > 59 then return "" end
+    local t = utc_str_to_timestamp(date)
+    if not t then return "" end
     local xml_offset = (tonumber(offset_h) * 3600) + (tonumber(offset_m) * 60)
     if sign == "+" then t = t - xml_offset else t = t + xml_offset end
-    local utc_time = os.date("!%Y%m%d%H%M%S", t)
+    local ok, utc_time = pcall(os.date, "!%Y%m%d%H%M%S", t)
+    if not ok then return "" end
     xmltv_utc_cache[time_str] = utc_time
     return utc_time
 end
@@ -140,20 +126,28 @@ end
 
 -- 将 YYYYMMDDHHmmss UTC字符串转为 Unix 时间戳
 function utc_str_to_timestamp(s)
+    if type(s) ~= "string" or not s:match("^%d%d%d%d%d%d%d%d%d%d%d%d%d%d$") then return nil end
     local cached_timestamp = utc_timestamp_cache[s]
     if cached_timestamp ~= nil then return cached_timestamp end
 
-    if not s or #s < 14 then return nil end
     local y  = tonumber(s:sub(1,4))
     local mo = tonumber(s:sub(5,6))
     local d  = tonumber(s:sub(7,8))
     local h  = tonumber(s:sub(9,10))
     local mi = tonumber(s:sub(11,12))
     local sc = tonumber(s:sub(13,14))
-    if not (y and mo and d and h and mi and sc) then return nil end
-    -- os.time{} 把参数当本地时间解释，返回UTC时间戳
-    -- 输入是UTC时间，所以需要加上本地偏移量，抵消 os.time 的本地化处理
-    local timestamp = os.time{year=y, month=mo, day=d, hour=h, min=mi, sec=sc} + get_local_timezone_offset()
+    if y < 1 or mo < 1 or mo > 12 or h > 23 or mi > 59 or sc > 59 then return nil end
+    local leap = y % 4 == 0 and (y % 100 ~= 0 or y % 400 == 0)
+    local month_days = {31, leap and 29 or 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31}
+    if d < 1 or d > month_days[mo] then return nil end
+    -- 直接计算 Gregorian 日期距 Unix epoch 的天数，避开本地时区和 DST 的歧义/缺失时刻。
+    local year = y - (mo <= 2 and 1 or 0)
+    local era = math.floor(year / 400)
+    local year_of_era = year - era * 400
+    local day_of_year = math.floor((153 * (mo + (mo > 2 and -3 or 9)) + 2) / 5) + d - 1
+    local days = era * 146097 + year_of_era * 365 + math.floor(year_of_era / 4)
+        - math.floor(year_of_era / 100) + day_of_year - 719468
+    local timestamp = days * 86400 + h * 3600 + mi * 60 + sc
     utc_timestamp_cache[s] = timestamp
     return timestamp
 end
@@ -171,21 +165,108 @@ function calc_resume_end_utc(start_utc)
     return result
 end
 
--- 通用的时间参数替换函数，支持多种格式
-function replace_catchup_time_params(catchup_url, start_utc, end_utc)
-    -- 1. 标准回看模板（OK影视等）：${utc:yyyyMMddHHmmss} 和 ${utcend:yyyyMMddHHmmss}
-    catchup_url = catchup_url:gsub("%${(utc):yyyyMMddHHmmss%}", start_utc)
-    catchup_url = catchup_url:gsub("%${(utcend):yyyyMMddHHmmss%}", end_utc)
+local function catchup_timezone(zone)
+    zone = trim(zone):lower()
+    if zone == "" or zone == "local" then return "local" end
+    if zone == "utc" or zone == "gmt" then return 0 end
+    zone = zone:gsub("^gmt", ""):gsub("^utc", "")
+    local sign, hours, minutes = zone:match("^([+-])(%d%d?):(%d%d)$")
+    if not sign then sign, hours, minutes = zone:match("^([+-])(%d%d)(%d%d)$") end
+    if not sign then sign, hours = zone:match("^([+-])(%d%d?)$"); minutes = "0" end
+    hours, minutes = tonumber(hours), tonumber(minutes)
+    if not sign or hours > 14 or minutes > 59 or (hours == 14 and minutes ~= 0) then return nil end
+    return (hours * 3600 + minutes * 60) * (sign == "-" and -1 or 1)
+end
 
-    -- 2. KU9回看模板（酷9最新版）：${(b)yyyyMMddHHmmss|UTC} 和 ${(e)yyyyMMddHHmmss|UTC}
-    catchup_url = catchup_url:gsub("%${%(b%)yyyyMMddHHmmss|UTC%}", start_utc)
-    catchup_url = catchup_url:gsub("%${%(e%)yyyyMMddHHmmss|UTC%}", end_utc)
+local function catchup_date_format(format)
+    local tokens = {yyyy = "%Y", MM = "%m", dd = "%d", HH = "%H", mm = "%M", ss = "%S"}
+    local result, index = {}, 1
+    while index <= #format do
+        local token = format:sub(index, index + 3) == "yyyy" and "yyyy" or format:sub(index, index + 1)
+        if tokens[token] then
+            result[#result + 1] = tokens[token]
+            index = index + #token
+        else
+            local char = format:sub(index, index)
+            if not char:match("[%d%s%-%/:_%.]") then return nil end
+            result[#result + 1] = char
+            index = index + 1
+        end
+    end
+    return #result > 0 and table.concat(result) or nil
+end
 
-    -- 3. APTV回看模板：${(b)yyyyMMddHHmmss:utc} 和 ${(e)yyyyMMddHHmmss:utc}
-    catchup_url = catchup_url:gsub("%${%(b%)yyyyMMddHHmmss:utc%}", start_utc)
-    catchup_url = catchup_url:gsub("%${%(e%)yyyyMMddHHmmss:utc%}", end_utc)
+-- 通用的时间参数替换函数：旧 UTC 模板、APTV/KU9 与 IPTV Simple 的常用占位符。
+function replace_catchup_time_params(catchup_url, start_utc, end_utc, local_timezone, now_ts)
+    if type(catchup_url) ~= "string" then return nil, "回看模板无效" end
+    local start_ts, end_ts = utc_str_to_timestamp(start_utc), utc_str_to_timestamp(end_utc)
+    if not start_ts or not end_ts or end_ts <= start_ts then return nil, "节目时间无效" end
+    local failure
+    local function format_time(timestamp, format, zone)
+        local offset = catchup_timezone(zone)
+        local date_format = format ~= "timestamp" and catchup_date_format(format) or nil
+        if offset == nil or (format ~= "timestamp" and not date_format) then
+            failure = "回看时间格式或时区不支持"
+            return ""
+        end
+        if format == "timestamp" then return string.format("%.0f", timestamp) end
+        local ok, result = pcall(os.date, (offset == "local" and "" or "!") .. date_format,
+            timestamp + (type(offset) == "number" and offset or 0))
+        if not ok then failure = "回看时间超出系统范围"; return "" end
+        return result
+    end
 
+    catchup_url = catchup_url:gsub("%${%(([be])%)([^{}]+)%}", function(which, body)
+        local format, zone = body:match("^(.-)|(.+)$")
+        if not format then
+            format, zone = body:match("^(.-):([Uu][Tt][Cc])$")
+        end
+        return format_time(which == "b" and start_ts or end_ts, format or body, zone or local_timezone)
+    end)
+    catchup_url = catchup_url:gsub("%${(utc%a*):([^{}]+)%}", function(which, format)
+        if which ~= "utc" and which ~= "utcend" then failure = "回看占位符不支持"; return "" end
+        return format_time(which == "utc" and start_ts or end_ts, format, "UTC")
+    end)
+    catchup_url = catchup_url:gsub("{(utc%a*):YmdHMS}", function(which)
+        if which ~= "utc" and which ~= "utcend" then failure = "回看占位符不支持"; return "" end
+        return format_time(which == "utc" and start_ts or end_ts, "yyyyMMddHHmmss", "UTC")
+    end)
+    local current_ts = now_ts or os.time()
+    local values = {utc = start_ts, utcend = end_ts, lutc = current_ts, duration = end_ts - start_ts,
+        start = start_ts, ["end"] = end_ts, now = current_ts, timestamp = current_ts}
+    catchup_url = catchup_url:gsub("%$?{(%a+)}", function(key)
+        if values[key] then return string.format("%.0f", values[key]) end
+        failure = "回看占位符不支持"
+        return ""
+    end)
+    if failure or catchup_url:find("{", 1, true) or catchup_url:find("}", 1, true) then
+        return nil, failure or "回看占位符不支持"
+    end
     return catchup_url
+end
+
+function build_catchup_url(live_url, template, catchup_type, start_utc, end_utc, local_timezone)
+    local url = template:gsub("{url}", function() return live_url or "" end)
+    local mode = trim(catchup_type):lower()
+    if mode == "none" then return nil, "频道未启用回看" end
+    if mode == "append" or (mode == "" and url:match("^[?&]")) then
+        if not live_url or live_url == "" then return nil, "回看缺少直播地址" end
+        if url:match("^[%a][%w+.-]*://") then return nil, "append 回看模板应为地址后缀" end
+        local base, fragment = live_url:match("^(.-)(#.*)$")
+        base = base or live_url
+        if url:match("^[?&]") then
+            local separator = base:find("?", 1, true) and "&" or "?"
+            if base:match("[?&]$") then separator = "" end
+            url = separator .. url:gsub("^[?&]+", "")
+        end
+        url = base .. url .. (url:find("#", 1, true) and "" or fragment or "")
+    end
+    return replace_catchup_time_params(url, start_utc, end_utc, local_timezone)
+end
+
+function catchup_time_in_window(start_utc, days, now_ts)
+    local timestamp = utc_str_to_timestamp(start_utc)
+    return timestamp ~= nil and (not days or timestamp >= (now_ts or os.time()) - days * 86400)
 end
 
 function format_display_date(time_str, today_start)
